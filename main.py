@@ -30,6 +30,7 @@ ADMIN_KEY = os.environ["ADMIN_KEY"]
 TRUECALLER_BOT = "@Truecaller_redbot"
 NICK_BOT       = "@Nick_Bypass_Bot"
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "@RAJFFLIVEBOT")
+LEAK_BOT       = os.environ.get("LEAK_BOT", "")
 CACHE_TTL      = int(os.environ.get("CACHE_TTL", 86400))  # seconds, default 24h
 
 logging.basicConfig(level=logging.INFO)
@@ -39,8 +40,9 @@ app  = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 loop = None
 
-pending = {}
-stats   = {"total": 0, "success": 0, "failed": 0, "cache_hits": 0}
+pending      = {}
+leak_pending = {}
+stats        = {"total": 0, "success": 0, "failed": 0, "cache_hits": 0}
 
 # ==================== IN-MEMORY CACHE ====================
 # Structure: { normalized_number: {"result": {...}, "ts": float} }
@@ -131,6 +133,9 @@ def set_config(key, value):
 
 def get_bot_username():
     return get_config("bot_username", BOT_USERNAME)
+
+def get_leak_bot():
+    return get_config("leak_bot", LEAK_BOT)
 
 # ==================== AUTO-SEED SESSIONS FROM ENV ====================
 def seed_sessions_from_env():
@@ -458,6 +463,94 @@ async def on_message(event):
 
     pending[matched_id]["result"] = result
     pending[matched_id]["done"]   = True
+
+# ==================== LEAK EVENT HANDLER ====================
+@events.register(events.NewMessage)
+async def on_leak_message(event):
+    msg = event.message
+    if not msg or not msg.text: return
+    sender = await event.get_sender()
+    uname  = (getattr(sender, 'username', '') or "").lower()
+    lb     = get_leak_bot().lstrip('@').lower()
+    if not lb or lb not in uname: return
+
+    matched_id = None; oldest_ts = float('inf')
+    for rid, req in list(leak_pending.items()):
+        if req.get("done"): continue
+        age = time.time() - req["ts"]
+        if age > 180: leak_pending.pop(rid, None); continue
+        if req["ts"] < oldest_ts: oldest_ts = req["ts"]; matched_id = rid
+    if not matched_id: return
+
+    leak_pending[matched_id]["raw"]  = msg.text
+    leak_pending[matched_id]["done"] = True
+
+# ==================== LEAK LOOKUP ====================
+def leak_lookup():
+    import json as _json
+    from flask import Response as _Resp
+    t_start = time.time()
+    number  = request.args.get('num') or request.args.get('number', '')
+    if not number:
+        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+
+    lb = get_leak_bot()
+    if not lb:
+        return jsonify({"success": False, "error": "Leak bot not configured. Set LEAK_BOT env var or configure in admin panel."}), 503
+
+    _, num_c, country = valid_num(number)
+    if not num_c:
+        return jsonify({"success": False, "error": "Invalid number"}), 400
+
+    acc_id, acc_client = acc_manager.next_client()
+    if not acc_client:
+        return jsonify({"success": False, "error": "No active Telegram accounts"}), 503
+
+    req_id = f"leak_{int(time.time()*1000)}_{num_c}"
+    leak_pending[req_id] = {
+        "number": num_c,
+        "ts":     time.time(),
+        "done":   False,
+        "raw":    None
+    }
+
+    async def _send():
+        await acc_client.send_message(lb, num_c)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
+    except Exception as e:
+        leak_pending.pop(req_id, None)
+        return jsonify({"success": False, "error": f"Send failed: {e}"}), 500
+
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        req = leak_pending.get(req_id, {})
+        if req.get("done"):
+            raw = req["raw"]
+            leak_pending.pop(req_id, None)
+            elapsed = f"{(time.time() - t_start):.2f}s"
+            data = {
+                "success":       True,
+                "number":        num_c,
+                "country":       country,
+                "source":        lb,
+                "raw_response":  raw,
+                "response_time": elapsed,
+                "made_by":       get_bot_username()
+            }
+            return _Resp(_json.dumps(data, ensure_ascii=False), mimetype='application/json')
+        time.sleep(0.3)
+
+    leak_pending.pop(req_id, None)
+    elapsed = f"{(time.time() - t_start):.2f}s"
+    return jsonify({"success": False, "error": "Timeout — leak bot didn't respond in 60s",
+                    "response_time": elapsed}), 504
+
+@app.route('/leak', methods=['GET'])
+@require_key
+def api_leak():
+    return leak_lookup()
 
 # ==================== LOOKUP (with cache + response time) ====================
 def num_lookup():
@@ -846,7 +939,7 @@ def admin_clear_cache():
 @require_admin
 def admin_get_config():
     return jsonify({"success": True, "bot_username": get_bot_username(),
-                    "cache_ttl": CACHE_TTL})
+                    "leak_bot": get_leak_bot(), "cache_ttl": CACHE_TTL})
 
 @app.route('/admin/config', methods=['POST'])
 @require_admin
@@ -856,7 +949,11 @@ def admin_set_config():
         val = str(data["bot_username"]).strip()
         if not val.startswith("@"): val = "@" + val
         set_config("bot_username", val)
-    return jsonify({"success": True, "bot_username": get_bot_username()})
+    if "leak_bot" in data:
+        val = str(data["leak_bot"]).strip()
+        if val and not val.startswith("@"): val = "@" + val
+        set_config("leak_bot", val)
+    return jsonify({"success": True, "bot_username": get_bot_username(), "leak_bot": get_leak_bot()})
 
 # ==================== ADMIN HTML (Login + Panel) ====================
 
@@ -1046,6 +1143,12 @@ tr:hover td{background:rgba(124,92,252,.05)}
     <div class="card-hd"><h2><span class="dot"></span>Bot Settings</h2></div>
     <label>Bot Username (shown in all API responses)</label>
     <input id="cfgBotUn" placeholder="@RAJFFLIVEBOT"/>
+    <label>Leak Bot Username (/leak endpoint pe yahi bot use hoga)</label>
+    <input id="cfgLeakBot" placeholder="@LeakBotUsername"/>
+    <div class="info-box">
+      💡 <code>/leak?num=9876543210&key=YOUR_KEY</code> — is bot se leaked data fetch karta hai.
+      Env var <code>LEAK_BOT</code> set karo ya yahan save karo.
+    </div>
     <div class="btn-row">
       <button onclick="saveConfig()">💾 Save Settings</button>
     </div>
@@ -1240,12 +1343,15 @@ async function loadStats(){
   document.getElementById('cacheTtl').textContent   = (d.cache?.ttl_hours ?? '—') + 'h';
   const inp = document.getElementById('cfgBotUn');
   if(inp && !inp.value) inp.value = d.bot_username || '';
+  const inp2 = document.getElementById('cfgLeakBot');
+  if(inp2 && !inp2.value) inp2.value = d.leak_bot || '';
 }
 
 async function saveConfig(){
-  const val = document.getElementById('cfgBotUn').value.trim();
+  const val  = document.getElementById('cfgBotUn').value.trim();
+  const val2 = document.getElementById('cfgLeakBot').value.trim();
   if(!val){ toast('Enter a bot username','err'); return; }
-  const d = await apiPost('/admin/config',{bot_username:val});
+  const d = await apiPost('/admin/config',{bot_username:val, leak_bot:val2});
   if(d.success){ toast('Settings saved!','ok'); loadStats(); }
   else toast(d.error||'Failed','err');
 }
@@ -1372,6 +1478,7 @@ async def start_all_clients():
                 print(f"[ACC] {row['name']} — NOT authorized"); continue
             acc_manager.set_client(row["id"], client)
             client.add_event_handler(on_message)
+            client.add_event_handler(on_leak_message)
             print(f"[ACC] {row['name']} — connected OK")
         except Exception as e:
             print(f"[ACC] {row['name']} — failed: {e}")
