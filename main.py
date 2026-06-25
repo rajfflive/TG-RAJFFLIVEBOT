@@ -490,32 +490,46 @@ def leak_lookup():
     import json as _json
     from flask import Response as _Resp
     t_start = time.time()
-    number  = request.args.get('num') or request.args.get('number', '')
-    if not number:
-        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+
+    # Accept any query: q= (text/email/anything) OR num=/number= (phone)
+    query = (request.args.get('q') or request.args.get('num') or
+             request.args.get('number') or request.args.get('text') or
+             request.args.get('email') or '').strip()
+    if not query:
+        return jsonify({"success": False, "error": "Missing parameter. Use ?q=anything OR ?num=number"}), 400
 
     lb = get_leak_bot()
     if not lb:
         return jsonify({"success": False, "error": "Leak bot not configured. Set LEAK_BOT env var or configure in admin panel."}), 503
 
-    _, num_c, country = valid_num(number)
-    if not num_c:
-        return jsonify({"success": False, "error": "Invalid number"}), 400
-
     acc_id, acc_client = acc_manager.next_client()
     if not acc_client:
         return jsonify({"success": False, "error": "No active Telegram accounts"}), 503
 
-    req_id = f"leak_{int(time.time()*1000)}_{num_c}"
-    leak_pending[req_id] = {
-        "number": num_c,
-        "ts":     time.time(),
-        "done":   False,
-        "raw":    None
-    }
+    # Build send message
+    # If custom fmt provided: use it with {q} or {num} placeholder
+    fmt = request.args.get('fmt', '').strip()
+    if fmt:
+        send_msg = fmt.replace('{q}', query).replace('{num}', query)
+    else:
+        # Auto-format phone numbers with country code, else send raw
+        digits = re.sub(r'[^\d]', '', query)
+        if len(digits) == 10:
+            send_msg = f"+91{digits}"                    # India
+        elif len(digits) == 11 and digits.startswith('03'):
+            send_msg = f"+92{digits[1:]}"                # Pakistan
+        elif len(digits) == 12 and digits.startswith('91'):
+            send_msg = f"+{digits}"                      # already +91xxx
+        elif len(digits) == 12 and digits.startswith('92'):
+            send_msg = f"+{digits}"                      # already +92xxx
+        else:
+            send_msg = query                             # text/email/other — send as-is
+
+    req_id = f"leak_{int(time.time()*1000)}_{re.sub(r'[^a-zA-Z0-9]','_',query)[:20]}"
+    leak_pending[req_id] = {"query": query, "ts": time.time(), "done": False, "raw": None}
 
     async def _send():
-        await acc_client.send_message(lb, num_c)
+        await acc_client.send_message(lb, send_msg)
 
     try:
         asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
@@ -532,12 +546,9 @@ def leak_lookup():
             elapsed = f"{(time.time() - t_start):.2f}s"
             data = {
                 "success":       True,
-                "number":        num_c,
-                "country":       country,
-                "source":        lb,
-                "raw_response":  raw,
-                "response_time": elapsed,
-                "made_by":       get_bot_username()
+                "query":         query,
+                "response":      raw,
+                "response_time": elapsed
             }
             return _Resp(_json.dumps(data, ensure_ascii=False), mimetype='application/json')
         time.sleep(0.3)
@@ -551,6 +562,50 @@ def leak_lookup():
 @require_key
 def api_leak():
     return leak_lookup()
+
+# ==================== COUNTRY-SPECIFIC ENDPOINTS ====================
+
+@app.route('/ind', methods=['GET'])
+@require_key
+def api_india():
+    number = (request.args.get('num') or request.args.get('number', '')).strip()
+    if not number:
+        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+    digits = re.sub(r'[^\d]', '', number)
+    # Accept: 10 digit, or 12 digit starting 91, or with +91
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    elif len(digits) == 10:
+        pass
+    else:
+        return jsonify({"success": False, "error": "Indian number format galat hai. 10 digit ya +91XXXXXXXXXX dein"}), 400
+    # Force the cleaned number into request for num_lookup
+    from werkzeug.test import EnvironBuilder
+    from werkzeug.wrappers import Request as WRequest
+    orig = request.args.get('num', '')
+    # patch: replace number in args so num_lookup picks correct value
+    request.environ['QUERY_STRING'] = request.query_string.decode().replace(
+        f'num={orig}', f'num={digits}'
+    )
+    return num_lookup()
+
+@app.route('/pak', methods=['GET'])
+@require_key
+def api_pakistan():
+    number = (request.args.get('num') or request.args.get('number', '')).strip()
+    if not number:
+        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+    digits = re.sub(r'[^\d]', '', number)
+    # Accept: 03XXXXXXXXX (11), or 923XXXXXXXX (12), or +923XXXXXXXX
+    if len(digits) == 12 and digits.startswith('92'):
+        digits = '0' + digits[2:]   # convert to 03XX format
+    if not (len(digits) == 11 and digits.startswith('03')):
+        return jsonify({"success": False, "error": "Pakistani number format galat hai. 03XXXXXXXXX ya +923XXXXXXXX dein"}), 400
+    orig = request.args.get('num', '')
+    request.environ['QUERY_STRING'] = request.query_string.decode().replace(
+        f'num={orig}', f'num={digits}'
+    )
+    return num_lookup()
 
 # ==================== LOOKUP (with cache + response time) ====================
 def num_lookup():
