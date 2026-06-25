@@ -1,0 +1,4 @@
+flask>=3.0.0
+telethon>=1.36.0
+python-telegram-bot>=21.0
+requests>=2.32.0
