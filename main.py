@@ -479,9 +479,9 @@ async def on_message(event):
 
 # ==================== LEAK AUTO-PAGINATOR ====================
 async def auto_paginate(req_id, msg, client, max_pages=30):
-    """Click ▶ button on each page until no more next page or max reached."""
-    NEXT_LABELS = {"▶", "▶️", "→", "Next", "next", ">", ">>"}
-    seen_texts  = set()
+    """Click ➡ button on each page until no more next page or max reached."""
+    NEXT_LABELS = {"▶", "▶️", "→", "➡", "➡️", "Next", "next", ">", ">>", "⇒"}
+    seen_texts  = {msg.text or ""}  # seed with first page so we detect changes
 
     for page_num in range(max_pages):
         if req_id not in leak_pending: return
@@ -536,51 +536,137 @@ async def auto_paginate(req_id, msg, client, max_pages=30):
 # ==================== LEAK TEXT PARSER ====================
 def parse_leak_text(all_text):
     """
-    Parse raw leak bot text into structured records.
-    Handles: 'Key - value', 'Key: value', 'Key | value' formats.
-    Splits records by blank lines or separator lines.
+    Parse raw leak bot text (OSINTINFOSBOT format) into structured sources + records.
+    Handles:
+      - Emoji-prefixed fields:  📱 Telephone:  919335474660
+      - Plain fields:           Full name:  Ram Ashray Prajapati
+      - Source headers:         **💾HiTeckGroop.in**  or  HiTeckGroop.in
+      - Description paragraphs: long prose before data fields (skipped)
+      - Multi-value fields:     multiple Telephone lines → list
     """
-    FIELD_KEYS = ['email','password','phone','nick','login','link',
-                  'name','number','ip','hash','username','url','app',
-                  'appmobileordesktopapplication','domain','source']
+    # Strip ALL leading emoji/symbols from a line to expose key-value
+    _EMOJI_RE = re.compile(
+        r'^[\U00010000-\U0010ffff\u2000-\u26FF\u2700-\u27BF'
+        r'\U0001F300-\U0001F9FF\U0001FA00-\U0001FA9F'
+        r'📱📞🏠👤👨📄🌐🔑💾🗂️\s\*\[\]()•\-_=~]+',
+        re.UNICODE
+    )
+    # A line is a data field if it matches  Key:  Value  or  Key - Value
+    # Allow multi-word keys (including "The name of the father")
+    _FIELD_RE = re.compile(
+        r'^(.{1,50}?)\s{0,3}[:\-]\s{1,5}(.+)$'
+    )
+    # A source header: **text** or line with no space and ends with .in/.com etc
+    _SOURCE_RE = re.compile(r'^\*{0,2}[^*\n]{2,60}\*{0,2}$')
 
-    def is_separator(line):
-        return bool(re.match(r'^[\-=_\*~•\s]{2,}$', line)) or line.strip() == ''
+    def is_blank(line):
+        return not line.strip()
 
-    def extract_fields(block_lines):
-        rec = {}
-        for line in block_lines:
-            line = line.strip()
-            if not line or is_separator(line): continue
-            # Try Key - value OR Key: value
-            m = re.match(r'^([A-Za-z][A-Za-z0-9_\s]{0,30})\s*[\-:]\s*(.+)$', line)
-            if m:
-                key = m.group(1).strip().title().replace(' ','')
-                val = m.group(2).strip()
-                if key.lower().replace(' ','') in FIELD_KEYS and val:
-                    rec[key] = val
-        return rec if rec else None
+    def strip_emoji(line):
+        return _EMOJI_RE.sub('', line.strip()).strip()
+
+    def is_prose(line):
+        """Long sentences — description text, not data."""
+        stripped = strip_emoji(line)
+        # If it has a colon but very long → probably prose
+        # If no colon/dash at all → prose
+        if len(stripped) > 120:
+            return True
+        if not re.search(r'[:\-]', stripped):
+            return True
+        return False
+
+    def try_field(line):
+        """Return (key, value) or None."""
+        stripped = strip_emoji(line)
+        if not stripped: return None
+        m = _FIELD_RE.match(stripped)
+        if not m: return None
+        key = m.group(1).strip().rstrip(':- ')
+        val = m.group(2).strip()
+        # Reject keys that are too long (prose sentence fragments)
+        if len(key) > 50 or len(key) < 2: return None
+        if not val: return None
+        return key, val
+
+    sources = []
+    current_source = None
+    current_rec    = {}
+    in_data        = False    # True once we see at least one data field in this source
+
+    def flush_rec():
+        nonlocal current_rec
+        if current_rec and current_source is not None:
+            sources[current_source]["records"].append(dict(current_rec))
+            current_rec = {}
+
+    def new_source(name):
+        nonlocal current_source, in_data, current_rec
+        flush_rec()
+        current_rec = {}
+        in_data = False
+        sources.append({"source": name, "records": []})
+        current_source = len(sources) - 1
 
     lines = all_text.split('\n')
-    records = []
-    current_block = []
 
     for line in lines:
-        if is_separator(line):
-            if current_block:
-                rec = extract_fields(current_block)
-                if rec: records.append(rec)
-                current_block = []
-        else:
-            current_block.append(line)
-    if current_block:
-        rec = extract_fields(current_block)
-        if rec: records.append(rec)
+        raw = line.strip()
+        if not raw:
+            # Blank line → flush current record
+            flush_rec()
+            continue
 
-    return records
+        # Detect source headers like **💾HiTeckGroop.in**
+        header_candidate = re.sub(r'[\*_\`]', '', strip_emoji(raw)).strip()
+        # Source header: short, no colon, looks like a site name
+        if (header_candidate and len(header_candidate) < 60
+                and not re.search(r'[:\-]\s', header_candidate)
+                and not is_prose(raw)
+                and re.search(r'[A-Za-z]{3,}', header_candidate)
+                and raw.startswith('**')):
+            flush_rec()
+            new_source(header_candidate)
+            continue
+
+        # Initialize default source if none exists
+        if current_source is None:
+            new_source("Unknown")
+
+        # Try to parse as data field
+        field = try_field(raw)
+
+        if field:
+            key, val = field
+            in_data = True
+            # Multi-value: if key already in record, make it a list
+            if key in current_rec:
+                existing = current_rec[key]
+                if isinstance(existing, list):
+                    existing.append(val)
+                else:
+                    current_rec[key] = [existing, val]
+            else:
+                current_rec[key] = val
+        else:
+            # Not a field — if we were collecting a record, flush it
+            if in_data and current_rec:
+                flush_rec()
+            # Skip prose / description lines
+
+    flush_rec()
+
+    # Flatten: return list of records with source name injected
+    all_records = []
+    for src in sources:
+        for rec in src["records"]:
+            rec["_source"] = src["source"]
+            all_records.append(rec)
+
+    return all_records, sources
 
 # ==================== LEAK SHARED MESSAGE PROCESSOR ====================
-NEXT_BTN_LABELS = {"▶", "▶️", "→", "Next", "next", ">", ">>"}
+NEXT_BTN_LABELS = {"▶", "▶️", "→", "➡", "➡️", "Next", "next", ">", ">>", "⇒"}
 
 def _extract_buttons(msg):
     buttons_data = []
@@ -730,20 +816,26 @@ def leak_lookup():
     def build_leak_response(req, elapsed):
         messages = req.get("messages") or []
         buttons  = req.get("buttons", [])
-        # Remove nav buttons (◀/▶) from final response — keep Download/Functions
-        nav_labels = {"▶","▶️","◀","◀️","←","→","<",">","<<",">>"}
-        final_btns = [b for b in buttons if b.get("text","").strip() not in nav_labels]
+        # Remove nav/page buttons — keep only action buttons like Download/Functions
+        nav_labels = {
+            "▶","▶️","◀","◀️","←","→","<",">","<<",">>",
+            "➡","➡️","⬅","⬅️","⇒","⇐","Next","next","Prev","prev"
+        }
+        final_btns = [b for b in buttons
+                      if b.get("text","").strip() not in nav_labels
+                      and not re.match(r'^\d+\\\\?\d+$', b.get("text","").strip())]
         all_text = "\n\n".join(messages)
-        records  = parse_leak_text(all_text)
+        all_records, sources = parse_leak_text(all_text)
         return {
             "status":        True,
             "query":         query,
             "developer":     DEVELOPER_TAG,
             "data": {
-                "total_records": len(records),
-                "records":       records,
-                "raw_response":  all_text,
-                "action_buttons": final_btns
+                "total_records":   len(all_records),
+                "sources_count":   len(sources),
+                "sources":         sources,
+                "raw_response":    all_text,
+                "action_buttons":  final_btns
             },
             "response_time": elapsed
         }
