@@ -1,7 +1,8 @@
 """
 Truecaller Userbot API — @RAJFFLIVEBOT
+- HTML file download karo (text pagination nahi)
 - Clean flat JSON output
-- All records returned (multi-row)
+- All records returned (multi-row, multi-source)
 - Auto access refresh via Nick_Bypass_Bot
 - Multi-account round-robin system
 - API Key management with expiry
@@ -9,6 +10,7 @@ Truecaller Userbot API — @RAJFFLIVEBOT
 - Response time tracking
 - In-memory cache with TTL
 - Admin panel with login (no key in URL)
+- Bot tag: @rajfflivebot | Dev: @rajfflive
 """
 
 from flask import Flask, request, jsonify, make_response, g
@@ -16,9 +18,10 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.sessions import StringSession
 import asyncio, threading, re, os, time, logging, requests
-import json, uuid, sqlite3
+import json, uuid, sqlite3, io
 from datetime import datetime, timedelta
 from functools import wraps
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ==================== CREDENTIALS (from env only) ====================
 API_ID    = int(os.environ["API_ID"])
@@ -32,6 +35,7 @@ NICK_BOT       = "@Nick_Bypass_Bot"
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "@RAJFFLIVEBOT")
 LEAK_BOT       = os.environ.get("LEAK_BOT", "")
 DEVELOPER_TAG  = os.environ.get("DEVELOPER_TAG", "👤 @RAJFFLIVE | 📢 t.me/RAJFFLIVE")
+BOT_TAG        = os.environ.get("BOT_TAG", "@RAJFFLIVEBOT")
 CACHE_TTL      = int(os.environ.get("CACHE_TTL", 86400))  # seconds, default 24h
 
 logging.basicConfig(level=logging.INFO)
@@ -46,7 +50,6 @@ leak_pending = {}
 stats        = {"total": 0, "success": 0, "failed": 0, "cache_hits": 0}
 
 # ==================== IN-MEMORY CACHE ====================
-# Structure: { normalized_number: {"result": {...}, "ts": float} }
 _cache: dict = {}
 _cache_lock  = threading.Lock()
 
@@ -213,14 +216,17 @@ def require_key(f):
     def decorated(*args, **kwargs):
         key = request.args.get("key", "")
         if key != API_KEY and not check_api_key(key):
-            return jsonify({"status": False, "error": "Invalid or expired API key", "developer": DEVELOPER_TAG}), 401
+            return jsonify({
+                "status": False,
+                "error": "Invalid or expired API key",
+                **make_footer()
+            }), 401
         return f(*args, **kwargs)
     return decorated
 
 def require_admin(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Accept from query param, JSON body, or cookie
         key = (request.args.get("key", "")
                or (request.json or {}).get("key", "")
                or request.cookies.get("adm_key", ""))
@@ -302,7 +308,199 @@ def extract_field(line, *keywords):
             if val: return val
     return None
 
-# ==================== PARSER ====================
+# ==================== HTML LEAK PARSER ====================
+# Emoji + symbol regex for stripping from field names
+_EMOJI_STRIP_RE = re.compile(
+    r'[\U00010000-\U0010ffff'
+    r'\u2000-\u26FF'
+    r'\u2700-\u27BF'
+    r'\U0001F000-\U0001FFFF'
+    r'\U00002702-\U000027B0'
+    r'\U000024C2-\U0001F251'
+    r'\u200d\ufe0f\u20e3'
+    r'\u00a9\u00ae'
+    r']+',
+    re.UNICODE
+)
+
+def _clean_field_name(raw: str) -> str:
+    """Strip emoji, asterisks, colons, extra spaces from a field key."""
+    s = raw.strip()
+    s = _EMOJI_STRIP_RE.sub('', s)
+    s = re.sub(r'[\*\_\[\]\(\)\#\~\`]', '', s)
+    s = s.strip().strip(':').strip('-').strip()
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+def _clean_source_name(raw: str) -> str:
+    """Strip emoji + markdown from source title for display."""
+    s = raw.strip()
+    s = re.sub(r'[\*\_]', '', s)
+    s = _EMOJI_STRIP_RE.sub('', s)
+    return s.strip()
+
+def parse_html_leak(html_content: bytes) -> tuple:
+    """
+    Parse HTML leak report (as sent by OSINTINFOSBOT / LeakBase bot) into
+    structured sources with descriptions and records.
+
+    Returns: (all_records: list, sources: list)
+    Each source: { source, source_clean, description, records: [{field:val,...}] }
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+    except Exception as e:
+        print(f"[HTML PARSE] BeautifulSoup error: {e}")
+        return [], []
+
+    sources = []
+
+    for block in soup.find_all('div', class_='block'):
+        # ── Source name ──
+        title_el = block.find('div', class_='block-title')
+        raw_title = title_el.get_text(separator='', strip=True) if title_el else 'Unknown'
+        source_display = raw_title.strip()           # with emoji (for display)
+        source_clean   = _clean_source_name(raw_title)  # without emoji
+
+        text_el = block.find('div', class_='block-text')
+        if not text_el:
+            sources.append({
+                'source': source_display,
+                'source_clean': source_clean,
+                'description': '',
+                'records': []
+            })
+            continue
+
+        # ── Parse fields from block-text ──
+        # Strategy: walk through direct children, collect (key, value) pairs
+        # Record boundaries: two consecutive <br> tags with no field between them
+        description_parts = []
+        in_description    = True   # True until first field is found
+        records           = []
+        current_rec       = {}
+        prev_was_br       = False
+
+        def flush_record():
+            nonlocal current_rec
+            if current_rec:
+                records.append(dict(current_rec))
+                current_rec = {}
+
+        children = list(text_el.children)
+        i = 0
+        while i < len(children):
+            child = children[i]
+
+            if isinstance(child, NavigableString):
+                text = str(child).strip()
+                if text:
+                    if in_description:
+                        description_parts.append(text)
+                    prev_was_br = False
+                i += 1
+                continue
+
+            if not isinstance(child, Tag):
+                i += 1
+                continue
+
+            if child.name == 'br':
+                if prev_was_br and not in_description:
+                    # Double <br> = record separator
+                    flush_record()
+                prev_was_br = True
+                i += 1
+                continue
+
+            if child.name == 'b':
+                raw_key = child.get_text(separator='', strip=True)
+                key = _clean_field_name(raw_key)
+                if not key:
+                    i += 1
+                    continue
+
+                in_description = False
+                prev_was_br    = False
+
+                # Collect value: siblings until next <b> or <br>
+                val_parts = []
+                j = i + 1
+                while j < len(children):
+                    sib = children[j]
+                    if isinstance(sib, NavigableString):
+                        t = str(sib).strip()
+                        if t:
+                            val_parts.append(t)
+                        j += 1
+                    elif isinstance(sib, Tag):
+                        if sib.name == 'b':
+                            break   # next field starts
+                        elif sib.name == 'br':
+                            j += 1
+                            break   # end of this field's line
+                        elif sib.name in ('code', 'em', 'strong', 'span', 'a', 'i'):
+                            t = sib.get_text(strip=True)
+                            if t:
+                                val_parts.append(t)
+                            j += 1
+                        else:
+                            j += 1
+                    else:
+                        j += 1
+
+                val = ' '.join(val_parts).strip()
+                # Remove leftover markdown chars from value
+                val = re.sub(r'[`]', '', val).strip()
+
+                if key and val:
+                    if key in current_rec:
+                        existing = current_rec[key]
+                        if isinstance(existing, list):
+                            existing.append(val)
+                        else:
+                            current_rec[key] = [existing, val]
+                    else:
+                        current_rec[key] = val
+
+                i = j  # advance to where inner loop ended
+                continue
+
+            # Any other tag: extract text if we're in description
+            if in_description:
+                t = child.get_text(strip=True)
+                if t:
+                    description_parts.append(t)
+            prev_was_br = False
+            i += 1
+
+        flush_record()
+
+        # Build clean description (max ~300 chars, no duplicates)
+        raw_desc = ' '.join(description_parts).strip()
+        # Collapse repeated spaces/newlines
+        raw_desc = re.sub(r'\s+', ' ', raw_desc).strip()
+
+        sources.append({
+            'source':       source_display,
+            'source_clean': source_clean,
+            'description':  raw_desc,
+            'records':      records
+        })
+
+    # Flat list of all records with _source injected
+    all_records = []
+    for src in sources:
+        for rec in src['records']:
+            flat = dict(rec)
+            flat['_source']       = src['source']
+            flat['_source_clean'] = src['source_clean']
+            all_records.append(flat)
+
+    return all_records, sources
+
+
+# ==================== TRUECALLER TEXT PARSER ====================
 def parse_response(text, number):
     if not text: return None
     tl = text.lower()
@@ -442,7 +640,7 @@ async def refresh_access(link, session_id, orig_number, acc_id=None):
         print(f"[REFRESH ERROR] {e}")
         return False
 
-# ==================== EVENT HANDLER ====================
+# ==================== TRUECALLER EVENT HANDLER ====================
 @events.register(events.NewMessage)
 async def on_message(event):
     msg = event.message
@@ -477,114 +675,121 @@ async def on_message(event):
     pending[matched_id]["result"] = result
     pending[matched_id]["done"]   = True
 
-# ==================== LEAK AUTO-PAGINATOR ====================
-async def auto_paginate(req_id, msg, client, max_pages=30):
-    """Click ➡ button on each page until no more next page or max reached."""
-    NEXT_LABELS = {"▶", "▶️", "→", "➡", "➡️", "Next", "next", ">", ">>", "⇒"}
-    seen_texts  = {msg.text or ""}  # seed with first page so we detect changes
+# ==================== LEAK: HTML DOCUMENT HANDLER ====================
+@events.register(events.NewMessage)
+async def on_leak_document(event):
+    """
+    Handle when leak bot sends an HTML file as document/attachment.
+    This is the FAST path — no pagination, direct HTML download + parse.
+    """
+    msg = event.message
+    if not msg: return
 
-    for page_num in range(max_pages):
-        if req_id not in leak_pending: return
+    sender = await event.get_sender()
+    uname  = (getattr(sender, 'username', '') or "").lower()
+    lb     = get_leak_bot().lstrip('@').lower()
+    if not lb or lb not in uname: return
 
-        # Find ▶ button row/col
-        next_row = next_col = None
-        try:
-            if msg.buttons:
-                for ri, row in enumerate(msg.buttons):
-                    for ci, btn in enumerate(row):
-                        if btn.text.strip() in NEXT_LABELS:
-                            next_row, next_col = ri, ci
-                            break
-        except Exception:
-            pass
+    # Only handle document messages (bot sends HTML as file)
+    if not msg.document: return
 
-        if next_row is None:
-            # No ▶ found — we're on the last page
-            leak_pending[req_id]["done"] = True
-            return
+    # Check it's an HTML file by mime or filename
+    doc  = msg.document
+    mime = getattr(doc, 'mime_type', '') or ''
+    fname = ''
+    if hasattr(doc, 'attributes'):
+        for attr in doc.attributes:
+            fn = getattr(attr, 'file_name', None)
+            if fn:
+                fname = fn.lower()
+                break
 
-        # Click ▶
-        try:
-            await msg.click(next_row, next_col)
-        except Exception as e:
-            print(f"[PAGINATE] click error: {e}")
-            leak_pending[req_id]["done"] = True
-            return
+    is_html = ('html' in mime) or fname.endswith('.html') or fname.endswith('.htm')
+    if not is_html:
+        print(f"[LEAK DOC] Not HTML — mime={mime} fname={fname}, skipping")
+        return
 
-        # Wait for bot to edit/send response (up to 8 seconds)
-        for _ in range(40):
-            await asyncio.sleep(0.2)
-            req = leak_pending.get(req_id, {})
-            new_msg = req.get("current_msg")
-            if new_msg and new_msg.id != msg.id:
-                msg = new_msg; break
-            elif new_msg and new_msg.id == msg.id:
-                # Could be edit — check if text changed
-                new_txt = (getattr(new_msg, 'text', '') or '')
-                if new_txt not in seen_texts and new_txt:
-                    msg = new_msg; break
-        else:
-            # Timeout waiting for next page
-            leak_pending[req_id]["done"] = True
-            return
+    # Find oldest pending leak request
+    matched_id = None; oldest_ts = float('inf')
+    for rid, req in list(leak_pending.items()):
+        if req.get("done"): continue
+        age = time.time() - req["ts"]
+        if age > 180: leak_pending.pop(rid, None); continue
+        if req["ts"] < oldest_ts: oldest_ts = req["ts"]; matched_id = rid
+    if not matched_id:
+        print("[LEAK DOC] No pending request found, ignoring HTML document")
+        return
 
-        seen_texts.add(msg.text or "")
+    print(f"[LEAK DOC] HTML file received ({getattr(doc, 'size', '?')} bytes), downloading...")
+    try:
+        html_bytes = await event.message.download_media(file=bytes)
+    except Exception as e:
+        print(f"[LEAK DOC] Download failed: {e}")
+        return
 
-    # Hit max pages
-    leak_pending[req_id]["done"] = True
+    if not html_bytes:
+        print("[LEAK DOC] Empty download, skipping")
+        return
 
-# ==================== LEAK TEXT PARSER ====================
+    print(f"[LEAK DOC] Downloaded {len(html_bytes)} bytes, parsing HTML...")
+    try:
+        all_records, sources = parse_html_leak(html_bytes)
+    except Exception as e:
+        print(f"[LEAK DOC] Parse error: {e}")
+        return
+
+    # Also extract any buttons (Download, Functions, etc.)
+    buttons_data = []
+    try:
+        if msg.buttons:
+            for row in msg.buttons:
+                for btn in row:
+                    b = {"text": btn.text}
+                    if hasattr(btn, 'url') and btn.url:
+                        b["url"] = btn.url
+                    buttons_data.append(b)
+    except Exception:
+        pass
+
+    leak_pending[matched_id]["html_records"] = all_records
+    leak_pending[matched_id]["html_sources"] = sources
+    leak_pending[matched_id]["buttons"]      = buttons_data
+    leak_pending[matched_id]["has_data"]     = True
+    leak_pending[matched_id]["mode"]         = "html"
+    leak_pending[matched_id]["done"]         = True
+    print(f"[LEAK DOC] Parsed {len(all_records)} records from {len(sources)} sources")
+
+
+# ==================== LEAK TEXT FALLBACK PARSER ====================
 def parse_leak_text(all_text):
     """
-    Parse raw leak bot text (OSINTINFOSBOT format) into structured sources + records.
-    Handles:
-      - Emoji-prefixed fields:  📱 Telephone:  919335474660
-      - Plain fields:           Full name:  Ram Ashray Prajapati
-      - Source headers:         **💾HiTeckGroop.in**  or  HiTeckGroop.in
-      - Description paragraphs: long prose before data fields (skipped)
-      - Multi-value fields:     multiple Telephone lines → list
+    Fallback: parse raw text (if bot sends text instead of HTML).
+    Handles OSINTINFOSBOT text format.
     """
-    # Strip ALL leading emoji/symbols from a line to expose key-value
     _EMOJI_RE = re.compile(
         r'^[\U00010000-\U0010ffff\u2000-\u26FF\u2700-\u27BF'
         r'\U0001F300-\U0001F9FF\U0001FA00-\U0001FA9F'
         r'📱📞🏠👤👨📄🌐🔑💾🗂️\s\*\[\]()•\-_=~]+',
         re.UNICODE
     )
-    # A line is a data field if it matches  Key:  Value  or  Key - Value
-    # Allow multi-word keys (including "The name of the father")
-    _FIELD_RE = re.compile(
-        r'^(.{1,50}?)\s{0,3}[:\-]\s{1,5}(.+)$'
-    )
-    # A source header: **text** or line with no space and ends with .in/.com etc
-    _SOURCE_RE = re.compile(r'^\*{0,2}[^*\n]{2,60}\*{0,2}$')
-
-    def is_blank(line):
-        return not line.strip()
+    _FIELD_RE = re.compile(r'^(.{1,50}?)\s{0,3}[:\-]\s{1,5}(.+)$')
 
     def strip_emoji(line):
         return _EMOJI_RE.sub('', line.strip()).strip()
 
     def is_prose(line):
-        """Long sentences — description text, not data."""
         stripped = strip_emoji(line)
-        # If it has a colon but very long → probably prose
-        # If no colon/dash at all → prose
-        if len(stripped) > 120:
-            return True
-        if not re.search(r'[:\-]', stripped):
-            return True
+        if len(stripped) > 120: return True
+        if not re.search(r'[:\-]', stripped): return True
         return False
 
     def try_field(line):
-        """Return (key, value) or None."""
         stripped = strip_emoji(line)
         if not stripped: return None
         m = _FIELD_RE.match(stripped)
         if not m: return None
         key = m.group(1).strip().rstrip(':- ')
         val = m.group(2).strip()
-        # Reject keys that are too long (prose sentence fragments)
         if len(key) > 50 or len(key) < 2: return None
         if not val: return None
         return key, val
@@ -592,7 +797,7 @@ def parse_leak_text(all_text):
     sources = []
     current_source = None
     current_rec    = {}
-    in_data        = False    # True once we see at least one data field in this source
+    in_data        = False
 
     def flush_rec():
         nonlocal current_rec
@@ -605,21 +810,16 @@ def parse_leak_text(all_text):
         flush_rec()
         current_rec = {}
         in_data = False
-        sources.append({"source": name, "records": []})
+        sources.append({"source": name, "source_clean": _clean_source_name(name),
+                        "description": "", "records": []})
         current_source = len(sources) - 1
 
-    lines = all_text.split('\n')
-
-    for line in lines:
+    for line in all_text.split('\n'):
         raw = line.strip()
         if not raw:
-            # Blank line → flush current record
-            flush_rec()
-            continue
+            flush_rec(); continue
 
-        # Detect source headers like **💾HiTeckGroop.in**
         header_candidate = re.sub(r'[\*_\`]', '', strip_emoji(raw)).strip()
-        # Source header: short, no colon, looks like a site name
         if (header_candidate and len(header_candidate) < 60
                 and not re.search(r'[:\-]\s', header_candidate)
                 and not is_prose(raw)
@@ -629,17 +829,13 @@ def parse_leak_text(all_text):
             new_source(header_candidate)
             continue
 
-        # Initialize default source if none exists
         if current_source is None:
             new_source("Unknown")
 
-        # Try to parse as data field
         field = try_field(raw)
-
         if field:
             key, val = field
             in_data = True
-            # Multi-value: if key already in record, make it a list
             if key in current_rec:
                 existing = current_rec[key]
                 if isinstance(existing, list):
@@ -649,23 +845,22 @@ def parse_leak_text(all_text):
             else:
                 current_rec[key] = val
         else:
-            # Not a field — if we were collecting a record, flush it
             if in_data and current_rec:
                 flush_rec()
-            # Skip prose / description lines
 
     flush_rec()
 
-    # Flatten: return list of records with source name injected
     all_records = []
     for src in sources:
         for rec in src["records"]:
-            rec["_source"] = src["source"]
+            rec["_source"]       = src["source"]
+            rec["_source_clean"] = src.get("source_clean", src["source"])
             all_records.append(rec)
 
     return all_records, sources
 
-# ==================== LEAK SHARED MESSAGE PROCESSOR ====================
+
+# ==================== LEAK TEXT EVENT HANDLERS (fallback) ====================
 NEXT_BTN_LABELS = {"▶", "▶️", "→", "➡", "➡️", "Next", "next", ">", ">>", "⇒"}
 
 def _extract_buttons(msg):
@@ -684,7 +879,12 @@ def _extract_buttons(msg):
         pass
     return buttons_data
 
-async def _process_leak_event(event, is_edit=False):
+async def _process_leak_text_event(event, is_edit=False):
+    """
+    Handle text messages from leak bot.
+    PRIMARY PATH: detect 'Download' button → click it → HTML file will arrive.
+    FALLBACK: collect text pages if no Download button found.
+    """
     msg = event.message
     if not msg: return
     txt = msg.text or ""
@@ -695,7 +895,6 @@ async def _process_leak_event(event, is_edit=False):
     lb     = get_leak_bot().lstrip('@').lower()
     if not lb or lb not in uname: return
 
-    # Find the oldest pending (not done) request
     matched_id = None; oldest_ts = float('inf')
     for rid, req in list(leak_pending.items()):
         if req.get("done"): continue
@@ -704,23 +903,61 @@ async def _process_leak_event(event, is_edit=False):
         if req["ts"] < oldest_ts: oldest_ts = req["ts"]; matched_id = rid
     if not matched_id: return
 
-    # Skip pure summary/stats messages (no actual data fields)
-    has_summary = any(x in txt for x in [
-        "A lot of results were found", "Subjects made:",
-        "The number of leaks:", "Search time:", "You are shown"
-    ])
-    has_data = bool(re.search(
-        r'(Email|Password|Phone|Nick|Link|Name|Address|CNIC|Number|Login|IP|Hash|Username)\s*[\-:\|]',
+    req = leak_pending[matched_id]
+
+    # Already handled via HTML document path — skip all text
+    if req.get("mode") == "html":
+        return
+    # Already clicked Download, wait for HTML document to arrive
+    if req.get("download_clicked"):
+        return
+
+    # ── Skip pure summary/stats messages (the "faltu" first message) ──
+    SUMMARY_MARKERS = [
+        "Subjects made:", "The number of leaks:", "Search time:",
+        "Number of results:", "A lot of results were found",
+        "You are shown", "Mirror (in case", "InfrvsBot",
+        "Please note that you use", "subscription reduces"
+    ]
+    has_summary = any(x in txt for x in SUMMARY_MARKERS)
+    has_data    = bool(re.search(
+        r'(Telephone|Email|Password|Phone|Nick|Full name|Address|CNIC'
+        r'|Login|IP|Hash|Username|Document|Region|Adres|Date)\s*[:\-]',
         txt, re.IGNORECASE
     ))
     if has_summary and not has_data:
-        return  # pure stats summary — skip
+        print(f"[LEAK TEXT] Skipping stats/summary message")
+        return
 
+    # ── PRIMARY: Look for 'Download' button and click it ──
     buttons_data = _extract_buttons(msg)
-    has_next     = any(b["text"].strip() in NEXT_BTN_LABELS for b in buttons_data)
+    DOWNLOAD_LABELS = {"download", "📥 download", "⬇️ download",
+                       "⬇download", "📥download", "télécharger", "скачать"}
+    download_btn = next(
+        (b for b in buttons_data
+         if b.get("text", "").strip().lower() in DOWNLOAD_LABELS),
+        None
+    )
 
-    # Accumulate page text (deduplicate)
-    req = leak_pending[matched_id]
+    if download_btn and not req.get("download_clicked"):
+        req["download_clicked"] = True
+        req["has_data"]         = True
+        print(f"[LEAK TEXT] 'Download' button found — clicking now")
+        try:
+            if msg.buttons:
+                for ri, row in enumerate(msg.buttons):
+                    for ci, btn in enumerate(row):
+                        if btn.text.strip().lower() in DOWNLOAD_LABELS:
+                            await msg.click(ri, ci)
+                            print(f"[LEAK TEXT] Clicked Download [{ri},{ci}] ✓")
+                            return  # Wait for on_leak_document to fire
+        except Exception as e:
+            print(f"[LEAK TEXT] Download click failed: {e} — falling back to text collection")
+            req["download_clicked"] = False  # allow retry or text fallback
+
+    # ── FALLBACK: Collect text pages (if no Download button / click failed) ──
+    has_next = any(b["text"].strip() in NEXT_BTN_LABELS for b in buttons_data)
+
     if "messages" not in req:
         req["messages"] = []
     seen = req.get("seen_texts", set())
@@ -729,33 +966,33 @@ async def _process_leak_event(event, is_edit=False):
         seen.add(txt)
         req["seen_texts"] = seen
 
-    req["current_msg"] = msg      # paginator uses this
+    req["current_msg"] = msg
     req["buttons"]     = buttons_data
     req["has_data"]    = True
+    req["mode"]        = "text"
 
-    # If has ▶ and not already paginating → start auto-paginator
-    if has_next and not req.get("paginating"):
-        req["paginating"] = True
-        # Find which client has access to this msg
-        client = None
-        for aid in acc_manager.get_active_ids():
-            c = acc_manager.get_client(aid)
-            if c and c.is_connected():
-                client = c; break
-        if client:
-            asyncio.create_task(auto_paginate(matched_id, msg, client))
-    elif not has_next:
-        # Last page — no more ▶
+    if not has_next:
         req["done"] = True
+        print(f"[LEAK TEXT] Last page collected — text fallback done")
 
-# ==================== LEAK EVENT HANDLER ====================
 @events.register(events.NewMessage)
 async def on_leak_message(event):
-    await _process_leak_event(event, is_edit=False)
+    await _process_leak_text_event(event, is_edit=False)
 
 @events.register(events.MessageEdited)
 async def on_leak_edited(event):
-    await _process_leak_event(event, is_edit=True)
+    await _process_leak_text_event(event, is_edit=True)
+
+
+# ==================== BOT FOOTER (added to every leak response) ====================
+def make_footer():
+    """Return the bot/dev attribution block for every response."""
+    return {
+        "bot": get_bot_username(),
+        "developer": DEVELOPER_TAG,
+        "channel": "t.me/RAJFFLIVE"
+    }
+
 
 # ==================== LEAK LOOKUP ====================
 def leak_lookup():
@@ -763,45 +1000,56 @@ def leak_lookup():
     from flask import Response as _Resp
     t_start = time.time()
 
-    # Accept any query: q= (text/email/anything) OR num=/number= (phone)
     query = (request.args.get('q') or request.args.get('num') or
              request.args.get('number') or request.args.get('text') or
              request.args.get('email') or '').strip()
     if not query:
-        return jsonify({"status": False, "error": "Missing parameter. Use ?q=anything OR ?num=number", "developer": DEVELOPER_TAG}), 400
+        return jsonify({
+            "status": False,
+            "error": "Missing parameter. Use ?q=anything OR ?num=number",
+            **make_footer()
+        }), 400
 
     lb = get_leak_bot()
     if not lb:
-        return jsonify({"status": False, "error": "Leak bot not configured.", "developer": DEVELOPER_TAG}), 503
+        return jsonify({
+            "status": False,
+            "error": "Leak bot not configured.",
+            **make_footer()
+        }), 503
 
     acc_id, acc_client = acc_manager.next_client()
     if not acc_client:
-        return jsonify({"status": False, "error": "No active Telegram accounts", "developer": DEVELOPER_TAG}), 503
+        return jsonify({
+            "status": False,
+            "error": "No active Telegram accounts",
+            **make_footer()
+        }), 503
 
     # Build send message
-    # If custom fmt provided: use it with {q} or {num} placeholder
     fmt = request.args.get('fmt', '').strip()
     if fmt:
         send_msg = fmt.replace('{q}', query).replace('{num}', query)
     else:
-        # Auto-format phone numbers with country code, else send raw
         digits = re.sub(r'[^\d]', '', query)
         if len(digits) == 10:
-            send_msg = f"+91{digits}"                    # India
+            send_msg = f"+91{digits}"
         elif len(digits) == 11 and digits.startswith('03'):
-            send_msg = f"+92{digits[1:]}"                # Pakistan
+            send_msg = f"+92{digits[1:]}"
         elif len(digits) == 12 and digits.startswith('91'):
-            send_msg = f"+{digits}"                      # already +91xxx
+            send_msg = f"+{digits}"
         elif len(digits) == 12 and digits.startswith('92'):
-            send_msg = f"+{digits}"                      # already +92xxx
+            send_msg = f"+{digits}"
         else:
-            send_msg = query                             # text/email/other — send as-is
+            send_msg = query
 
     req_id = f"leak_{int(time.time()*1000)}_{re.sub(r'[^a-zA-Z0-9]','_',query)[:20]}"
     leak_pending[req_id] = {
-        "query": query, "ts": time.time(), "done": False, "raw": None,
+        "query": query, "ts": time.time(), "done": False,
         "messages": [], "seen_texts": set(), "buttons": [],
-        "has_data": False, "paginating": False
+        "has_data": False, "mode": None,
+        "download_clicked": False,          # True once Download button clicked
+        "html_records": None, "html_sources": None
     }
 
     async def _send():
@@ -811,54 +1059,127 @@ def leak_lookup():
         asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
     except Exception as e:
         leak_pending.pop(req_id, None)
-        return jsonify({"status": False, "error": f"Send failed: {e}", "developer": DEVELOPER_TAG}), 500
+        return jsonify({
+            "status": False,
+            "error": f"Send failed: {e}",
+            **make_footer()
+        }), 500
 
-    def build_leak_response(req, elapsed):
-        messages = req.get("messages") or []
-        buttons  = req.get("buttons", [])
-        # Remove nav/page buttons — keep only action buttons like Download/Functions
+    def _source_tag():
+        """Attribution tag string placed before and after every source block."""
+        bot  = get_bot_username()          # e.g. @RAJFFLIVEBOT
+        dev  = DEVELOPER_TAG               # e.g. 👤 @RAJFFLIVE | 📢 t.me/RAJFFLIVE
+        return f"🤖 {bot} | {dev}"
+
+    def _format_sources(sources):
+        """Wrap every source with tag_before / tag_after attribution."""
+        tag = _source_tag()
+        out = []
+        for src in sources:
+            out.append({
+                "tag_before":  tag,
+                "source":      src.get("source_clean") or src.get("source"),
+                "description": src.get("description", ""),
+                "records":     src.get("records", []),
+                "tag_after":   tag,
+            })
+        return out
+
+    def build_html_response(req, elapsed):
+        """Build response from parsed HTML (fast path)."""
+        sources  = req.get("html_sources") or []
+        all_recs = req.get("html_records") or []
+
         nav_labels = {
-            "▶","▶️","◀","◀️","←","→","<",">","<<",">>",
-            "➡","➡️","⬅","⬅️","⇒","⇐","Next","next","Prev","prev"
+            "▶","▶️","◀","◀️",
+            "←","→","<",">","<<",">>",
+            "➡","➡️","⬅","⬅️",
+            "⇒","⇐","Next","next","Prev","prev"
         }
-        final_btns = [b for b in buttons
-                      if b.get("text","").strip() not in nav_labels
-                      and not re.match(r'^\d+\\\\?\d+$', b.get("text","").strip())]
-        all_text = "\n\n".join(messages)
-        all_records, sources = parse_leak_text(all_text)
+        _page_re = re.compile(r"^\d+\\?\d+$")
+        final_btns = [
+            b for b in req.get("buttons", [])
+            if b.get("text","").strip() not in nav_labels
+            and not _page_re.match(b.get("text","").strip())
+        ]
+
         return {
-            "status":        True,
-            "query":         query,
-            "developer":     DEVELOPER_TAG,
+            "status": True,
+            "query":  query,
             "data": {
-                "total_records":   len(all_records),
-                "sources_count":   len(sources),
-                "sources":         sources,
-                "raw_response":    all_text,
-                "action_buttons":  final_btns
+                "mode":           "html",
+                "total_records":  len(all_recs),
+                "sources_count":  len(sources),
+                "sources":        _format_sources(sources),
+                "action_buttons": final_btns,
             },
-            "response_time": elapsed
+            "response_time": elapsed,
+            **make_footer()
         }
 
-    # Deadline: 120s — enough for full pagination (30 pages × ~3s each)
-    deadline = time.time() + 120
+    def build_text_response(req, elapsed):
+        """Build response from text fallback (paginated text pages)."""
+        messages = req.get("messages") or []
+        nav_labels = {
+            "▶","▶️","◀","◀️",
+            "←","→","<",">","<<",">>",
+            "➡","➡️","⬅","⬅️",
+            "⇒","⇐","Next","next","Prev","prev"
+        }
+        _page_re = re.compile(r"^\d+\\?\d+$")
+        final_btns = [
+            b for b in req.get("buttons", [])
+            if b.get("text","").strip() not in nav_labels
+            and not _page_re.match(b.get("text","").strip())
+        ]
+        all_text    = "\n\n".join(messages)
+        all_records, sources = parse_leak_text(all_text)
+
+        return {
+            "status": True,
+            "query":  query,
+            "data": {
+                "mode":           "text",
+                "total_records":  len(all_records),
+                "sources_count":  len(sources),
+                "sources":        _format_sources(sources),
+                "action_buttons": final_btns,
+            },
+            "response_time": elapsed,
+            **make_footer()
+        }
+
+    deadline = time.time() + 60
     while time.time() < deadline:
         req = leak_pending.get(req_id, {})
         if req.get("done"):
             leak_pending.pop(req_id, None)
             elapsed = f"{(time.time() - t_start):.2f}s"
-            return _Resp(_json.dumps(build_leak_response(req, elapsed), ensure_ascii=False),
-                         mimetype='application/json')
-        time.sleep(0.4)
+            if req.get("mode") == "html":
+                resp_data = build_html_response(req, elapsed)
+            else:
+                resp_data = build_text_response(req, elapsed)
+            return _Resp(_json.dumps(resp_data, ensure_ascii=False), mimetype='application/json')
+        time.sleep(0.3)
 
-    # Timeout — return whatever we collected
+    # Timeout
     req = leak_pending.pop(req_id, {})
     elapsed = f"{(time.time() - t_start):.2f}s"
     if req.get("has_data"):
-        return _Resp(_json.dumps(build_leak_response(req, elapsed), ensure_ascii=False),
-                     mimetype='application/json')
-    return jsonify({"status": False, "error": "Timeout — leak bot didn't respond",
-                    "developer": DEVELOPER_TAG, "response_time": elapsed}), 504
+        if req.get("mode") == "html":
+            return _Resp(_json.dumps(build_html_response(req, elapsed), ensure_ascii=False),
+                         mimetype='application/json')
+        else:
+            return _Resp(_json.dumps(build_text_response(req, elapsed), ensure_ascii=False),
+                         mimetype='application/json')
+
+    return jsonify({
+        "status": False,
+        "error": "Timeout — leak bot didn't respond",
+        "response_time": elapsed,
+        **make_footer()
+    }), 504
+
 
 @app.route('/leak', methods=['GET'])
 @require_key
@@ -872,12 +1193,14 @@ def api_leak():
 def api_india():
     number = (request.args.get('num') or request.args.get('number', '')).strip()
     if not number:
-        return jsonify({"status": False, "error": "Missing num parameter", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False, "error": "Missing num parameter", **make_footer()}), 400
     digits = re.sub(r'[^\d]', '', number)
     if len(digits) == 12 and digits.startswith('91'):
         digits = digits[2:]
     if len(digits) != 10:
-        return jsonify({"status": False, "error": "Indian number format galat hai. 10 digit ya +91XXXXXXXXXX dein", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False,
+                        "error": "Indian number format galat hai. 10 digit ya +91XXXXXXXXXX dein",
+                        **make_footer()}), 400
     g.override_num = digits
     return num_lookup()
 
@@ -886,27 +1209,29 @@ def api_india():
 def api_pakistan():
     number = (request.args.get('num') or request.args.get('number', '')).strip()
     if not number:
-        return jsonify({"status": False, "error": "Missing num parameter", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False, "error": "Missing num parameter", **make_footer()}), 400
     digits = re.sub(r'[^\d]', '', number)
     if len(digits) == 12 and digits.startswith('92'):
         digits = '0' + digits[2:]
     if not (len(digits) == 11 and digits.startswith('03')):
-        return jsonify({"status": False, "error": "Pakistani number format galat hai. 03XXXXXXXXX ya +923XXXXXXXX dein", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False,
+                        "error": "Pakistani number format galat hai. 03XXXXXXXXX ya +923XXXXXXXX dein",
+                        **make_footer()}), 400
     g.override_num = digits
     return num_lookup()
 
-# ==================== LOOKUP (with cache + response time) ====================
+# ==================== TRUECALLER LOOKUP ====================
 def num_lookup():
     t_start = time.time()
     number  = getattr(g, 'override_num', None) or request.args.get('num') or request.args.get('number', '')
     if not number:
-        return jsonify({"status": False, "error": "Missing number", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False, "error": "Missing number", **make_footer()}), 400
 
     _, num_c, country = valid_num(number)
     if not num_c:
-        return jsonify({"status": False, "error": "Empty number", "developer": DEVELOPER_TAG}), 400
+        return jsonify({"status": False, "error": "Empty number", **make_footer()}), 400
 
-    # ── Cache check ──
+    # Cache check
     cached = cache_get(num_c)
     if cached:
         stats["cache_hits"] += 1
@@ -915,10 +1240,10 @@ def num_lookup():
         resp_data = {
             "status":        True,
             "query":         num_c,
-            "developer":     DEVELOPER_TAG,
             "data":          {k: v for k, v in cached.items() if k not in ("status", "made_by")},
             "response_time": f"{(time.time() - t_start):.2f}s",
-            "cached":        True
+            "cached":        True,
+            **make_footer()
         }
         return _Resp(_json.dumps(resp_data, ensure_ascii=False), mimetype='application/json')
 
@@ -937,7 +1262,7 @@ def num_lookup():
     acc_id, acc_client = acc_manager.next_client()
     if not acc_client:
         pending.pop(req_id, None); stats["failed"] += 1
-        return jsonify({"status": False, "error": "No active Telegram accounts", "developer": DEVELOPER_TAG}), 503
+        return jsonify({"status": False, "error": "No active Telegram accounts", **make_footer()}), 503
 
     pending[req_id]["acc_id"] = acc_id
 
@@ -948,7 +1273,7 @@ def num_lookup():
         asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
     except Exception as e:
         pending.pop(req_id, None); stats["failed"] += 1
-        return jsonify({"status": False, "error": f"Send failed: {e}", "developer": DEVELOPER_TAG}), 500
+        return jsonify({"status": False, "error": f"Send failed: {e}", **make_footer()}), 500
 
     deadline = time.time() + 90
     while time.time() < deadline:
@@ -972,22 +1297,24 @@ def num_lookup():
                 data = {
                     "status":        True,
                     "query":         num_c,
-                    "developer":     DEVELOPER_TAG,
                     "data":          inner,
-                    "response_time": elapsed
+                    "response_time": elapsed,
+                    **make_footer()
                 }
                 cache_set(num_c, inner)
                 return _Resp(_json.dumps(data, ensure_ascii=False), mimetype='application/json')
             else:
                 stats["failed"] += 1
-                return jsonify({"status": False, "error": result.get("error", "No data"),
-                                "developer": DEVELOPER_TAG, "response_time": elapsed}), 500
+                return jsonify({"status": False,
+                                "error": result.get("error", "No data") if result else "No data",
+                                "response_time": elapsed,
+                                **make_footer()}), 500
         time.sleep(0.3)
 
     pending.pop(req_id, None); stats["failed"] += 1
     elapsed = f"{(time.time() - t_start):.2f}s"
     return jsonify({"status": False, "error": "Timeout — bot didn't respond in 90s",
-                    "developer": DEVELOPER_TAG, "response_time": elapsed}), 504
+                    "response_time": elapsed, **make_footer()}), 504
 
 # ==================== TG LOOKUP ====================
 USERID_API     = "https://username-usrid-to-num.onrender.com"
@@ -1058,12 +1385,12 @@ def tg_lookup():
     import json as _json
     from flask import Response as _Resp
     tg = request.args.get('tg', '').strip()
-    if not tg: return jsonify({"success": False, "error": "Missing tg param"}), 400
+    if not tg: return jsonify({"success": False, "error": "Missing tg param", **make_footer()}), 400
 
     is_username = not tg.lstrip('@').isdigit()
     if is_username:
         tg_info = run_async(resolve_username(tg))
-        if not tg_info: return jsonify({"success": False, "error": "Could not resolve username"}), 404
+        if not tg_info: return jsonify({"success": False, "error": "Could not resolve username", **make_footer()}), 404
     else:
         tg_info = run_async(resolve_userid(tg))
         if not tg_info: tg_info = {"name": f"User {tg}", "username": None, "telegram_id": tg}
@@ -1096,7 +1423,7 @@ def tg_lookup():
     result = {
         info_key:   {"name": tg_info["name"], "username": tg_info.get("username") or "N/A", "telegram_id": tg_id},
         "location": {"country": country, "country_code": country_code, "phone_number": phone_num},
-        "made_by":  get_bot_username()
+        **make_footer()
     }
     return _Resp(_json.dumps(result, ensure_ascii=False), mimetype='application/json')
 
@@ -1121,15 +1448,32 @@ def health():
         "accounts_connected": len(connected),
         "pending":            len(pending),
         "stats":              stats,
-        "cache":              cache_stats()
+        "cache":              cache_stats(),
+        **make_footer()
     })
 
 @app.route('/')
 def home():
     from flask import Response as _R
     bot_un = get_bot_username()
-    return _R(f'{{"status":true,"name":"RAJFF API","version":"2.0","developer":"{bot_un}"}}',
-              mimetype='application/json')
+    return _R(
+        json.dumps({
+            "status": True,
+            "name": "RAJFF API",
+            "version": "3.0",
+            "endpoints": {
+                "/api":   "Truecaller lookup (?num=NUMBER&key=KEY)",
+                "/ind":   "India number lookup (?num=10DIGIT&key=KEY)",
+                "/pak":   "Pakistan number lookup (?num=03XXXXXXXXX&key=KEY)",
+                "/leak":  "Leak database lookup (?q=NUMBER_OR_EMAIL&key=KEY)",
+                "/api/tg":"Telegram username/ID lookup (?tg=@username&key=KEY)"
+            },
+            "bot":       bot_un,
+            "developer": DEVELOPER_TAG,
+            "channel":   "t.me/RAJFFLIVE"
+        }, ensure_ascii=False),
+        mimetype='application/json'
+    )
 
 # ==================== ADMIN LOGIN ====================
 
@@ -1170,7 +1514,8 @@ def admin_stats():
         "pending":        len(pending),
         "stats":          stats,
         "cache":          cache_stats(),
-        "bot_username":   get_bot_username()
+        "bot_username":   get_bot_username(),
+        "leak_bot":       get_leak_bot()
     })
 
 @app.route('/admin/keys')
@@ -1272,6 +1617,9 @@ def admin_start_account():
         if not await client.is_user_authorized(): return False
         acc_manager.set_client(acc_id, client)
         client.add_event_handler(on_message)
+        client.add_event_handler(on_leak_document)
+        client.add_event_handler(on_leak_message)
+        client.add_event_handler(on_leak_edited)
         return True
 
     try:
@@ -1306,7 +1654,7 @@ def admin_set_config():
         set_config("leak_bot", val)
     return jsonify({"success": True, "bot_username": get_bot_username(), "leak_bot": get_leak_bot()})
 
-# ==================== ADMIN HTML (Login + Panel) ====================
+# ==================== ADMIN HTML ====================
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1324,40 +1672,25 @@ ADMIN_HTML = """<!DOCTYPE html>
   --tx:#8888aa;--tx2:#c0c0d8;
 }
 body{background:var(--bg);color:#e2e2f0;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
-
-/* ── LOGIN PAGE ── */
-#loginPage{
-  display:flex;align-items:center;justify-content:center;min-height:100vh;
-  background:radial-gradient(ellipse at 50% 0%,rgba(124,92,252,.12) 0%,transparent 70%)
-}
-.login-box{
-  background:var(--bg2);border:1px solid var(--brd2);border-radius:20px;
+#loginPage{display:flex;align-items:center;justify-content:center;min-height:100vh;
+  background:radial-gradient(ellipse at 50% 0%,rgba(124,92,252,.12) 0%,transparent 70%)}
+.login-box{background:var(--bg2);border:1px solid var(--brd2);border-radius:20px;
   padding:40px 36px;width:100%;max-width:380px;text-align:center;
-  box-shadow:0 0 60px rgba(124,92,252,.15)
-}
-.login-logo{
-  width:56px;height:56px;background:linear-gradient(135deg,var(--pu),#a855f7);
+  box-shadow:0 0 60px rgba(124,92,252,.15)}
+.login-logo{width:56px;height:56px;background:linear-gradient(135deg,var(--pu),#a855f7);
   border-radius:16px;display:flex;align-items:center;justify-content:center;
-  font-size:1.6rem;margin:0 auto 20px;box-shadow:0 0 24px var(--pu-glow)
-}
+  font-size:1.6rem;margin:0 auto 20px;box-shadow:0 0 24px var(--pu-glow)}
 .login-box h2{font-size:1.3rem;font-weight:800;margin-bottom:6px}
 .login-box p{font-size:.8rem;color:var(--tx);margin-bottom:28px}
-.login-input{
-  width:100%;background:var(--bg3);border:1px solid var(--brd2);border-radius:12px;
+.login-input{width:100%;background:var(--bg3);border:1px solid var(--brd2);border-radius:12px;
   padding:13px 16px;color:#e2e2f0;font-size:.9rem;outline:none;text-align:center;
-  letter-spacing:1px;transition:border .2s,box-shadow .2s;margin-bottom:14px
-}
+  letter-spacing:1px;transition:border .2s,box-shadow .2s;margin-bottom:14px}
 .login-input:focus{border-color:var(--pu);box-shadow:0 0 0 3px var(--pu-glow)}
-.login-btn{
-  width:100%;background:linear-gradient(135deg,var(--pu),var(--pu2));color:#fff;
+.login-btn{width:100%;background:linear-gradient(135deg,var(--pu),var(--pu2));color:#fff;
   border:none;border-radius:12px;padding:13px;font-size:.9rem;font-weight:700;
-  cursor:pointer;transition:all .2s;box-shadow:0 4px 16px rgba(92,63,216,.4)
-}
+  cursor:pointer;transition:all .2s;box-shadow:0 4px 16px rgba(92,63,216,.4)}
 .login-btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(92,63,216,.5)}
-.login-btn:active{transform:scale(.98)}
 .login-err{color:#f87171;font-size:.8rem;margin-top:10px;min-height:20px}
-
-/* ── MAIN PANEL ── */
 #mainPanel{display:none}
 header{background:linear-gradient(135deg,#110d2e 0%,#0d0d0f 60%);border-bottom:1px solid var(--brd);
   padding:16px 28px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:99;backdrop-filter:blur(10px)}
@@ -1431,7 +1764,6 @@ tr:hover td{background:rgba(124,92,252,.05)}
 .badge.green{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.2)}
 .badge.red{background:rgba(239,68,68,.12);color:#f87171;border:1px solid rgba(239,68,68,.2)}
 .badge.blue{background:rgba(96,165,250,.12);color:#60a5fa;border:1px solid rgba(96,165,250,.2)}
-.badge.yw{background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.2)}
 .key-cell{display:flex;align-items:center;gap:8px}
 .key-code{font-family:monospace;font-size:.78rem;color:#a78bfa;cursor:pointer;background:var(--bg3);
   border:1px solid var(--brd2);padding:3px 8px;border-radius:6px;max-width:160px;
@@ -1455,8 +1787,6 @@ tr:hover td{background:rgba(124,92,252,.05)}
 </head>
 <body>
 <div class="toast" id="toast"></div>
-
-<!-- ── LOGIN PAGE ── -->
 <div id="loginPage">
   <div class="login-box">
     <div class="login-logo">⚡</div>
@@ -1467,20 +1797,16 @@ tr:hover td{background:rgba(124,92,252,.05)}
     <div class="login-err" id="loginErr"></div>
   </div>
 </div>
-
-<!-- ── MAIN PANEL ── -->
 <div id="mainPanel">
 <header>
   <div class="logo">⚡</div>
   <h1>RAJFF API</h1>
-  <div class="hbadge">Admin Panel</div>
+  <div class="hbadge">Admin Panel v3.0</div>
   <div style="flex:1"></div>
   <button class="ghost sm" onclick="doLogout()" style="margin-right:8px">🚪 Logout</button>
   <div class="pulse" title="Online"></div>
 </header>
 <div class="wrap">
-
-  <!-- Stats -->
   <div class="stats-row">
     <div class="stat"><div class="ico">🔑</div><div class="val" id="st-keys">—</div><div class="lbl">API Keys</div></div>
     <div class="stat"><div class="ico">👤</div><div class="val" id="st-accs">—</div><div class="lbl">Accounts</div></div>
@@ -1488,24 +1814,18 @@ tr:hover td{background:rgba(124,92,252,.05)}
     <div class="stat"><div class="ico">💾</div><div class="val" id="st-cache">—</div><div class="lbl">Cached</div></div>
     <div class="stat"><div class="ico">📈</div><div class="val" id="st-hits">—</div><div class="lbl">Cache Hits</div></div>
   </div>
-
-  <!-- Bot Settings -->
   <div class="card">
     <div class="card-hd"><h2><span class="dot"></span>Bot Settings</h2></div>
     <label>Bot Username (shown in all API responses)</label>
     <input id="cfgBotUn" placeholder="@RAJFFLIVEBOT"/>
-    <label>Leak Bot Username (/leak endpoint pe yahi bot use hoga)</label>
+    <label>Leak Bot Username (/leak endpoint — HTML document mode)</label>
     <input id="cfgLeakBot" placeholder="@LeakBotUsername"/>
     <div class="info-box">
-      💡 <code>/leak?num=9876543210&key=YOUR_KEY</code> — is bot se leaked data fetch karta hai.
-      Env var <code>LEAK_BOT</code> set karo ya yahan save karo.
+      💡 <code>/leak?q=7985470106&key=KEY</code> — Bot ke HTML file ko directly download karke parse karta hai. Text pagination nahi hoti.<br/>
+      📌 Leak bot ko configure karo jo HTML file send karta ho (jaise OSINTINFOSBOT).
     </div>
-    <div class="btn-row">
-      <button onclick="saveConfig()">💾 Save Settings</button>
-    </div>
+    <div class="btn-row"><button onclick="saveConfig()">💾 Save Settings</button></div>
   </div>
-
-  <!-- Cache Management -->
   <div class="card">
     <div class="card-hd"><h2><span class="dot"></span>Cache</h2></div>
     <p style="font-size:.82rem;color:var(--tx2)">Results are cached in memory. Cache is cleared on server restart.</p>
@@ -1514,12 +1834,8 @@ tr:hover td{background:rgba(124,92,252,.05)}
       <span class="ci" style="margin-left:12px">Total entries:</span><span class="cv" id="cacheTotal">—</span>
       <span class="ci" style="margin-left:12px">TTL:</span><span class="cv" id="cacheTtl">—</span>
     </div>
-    <div class="btn-row">
-      <button class="danger" onclick="clearCache()">🗑️ Clear Cache</button>
-    </div>
+    <div class="btn-row"><button class="danger" onclick="clearCache()">🗑️ Clear Cache</button></div>
   </div>
-
-  <!-- Generate Key -->
   <div class="card">
     <div class="card-hd"><h2><span class="dot"></span>Generate API Key</h2></div>
     <div class="row3">
@@ -1538,8 +1854,6 @@ tr:hover td{background:rgba(124,92,252,.05)}
       </div>
     </div>
   </div>
-
-  <!-- Keys Table -->
   <div class="card">
     <div class="card-hd">
       <h2><span class="dot"></span>Active API Keys</h2>
@@ -1550,10 +1864,7 @@ tr:hover td{background:rgba(124,92,252,.05)}
       <tbody id="keysTbl"><tr><td colspan="7"><div class="empty"><div class="ei">⏳</div><p>Loading...</p></div></td></tr></tbody>
     </table></div>
   </div>
-
   <hr class="divider"/>
-
-  <!-- Add Account -->
   <div class="card">
     <div class="card-hd"><h2><span class="dot"></span>Add Telegram Account</h2></div>
     <div class="row2">
@@ -1564,12 +1875,10 @@ tr:hover td{background:rgba(124,92,252,.05)}
     <label>Session String (Telethon)</label>
     <textarea id="aSession" placeholder="Paste Telethon StringSession here..."></textarea>
     <div class="info-box">
-      💡 You can also add sessions via env: <code>STRING_SESSION</code>, <code>STRING_SESSION_2</code> ... <code>STRING_SESSION_5</code>
+      💡 Env vars: <code>STRING_SESSION</code>, <code>STRING_SESSION_2</code> ... <code>STRING_SESSION_5</code>
     </div>
     <div class="btn-row"><button class="success" onclick="addAccount()">➕ Add Account</button></div>
   </div>
-
-  <!-- Accounts Table -->
   <div class="card">
     <div class="card-hd">
       <h2><span class="dot"></span>Telegram Accounts</h2>
@@ -1580,238 +1889,118 @@ tr:hover td{background:rgba(124,92,252,.05)}
       <tbody id="accsTbl"><tr><td colspan="5"><div class="empty"><div class="ei">⏳</div><p>Loading...</p></div></td></tr></tbody>
     </table></div>
   </div>
-
 </div>
-</div><!-- end mainPanel -->
-
+</div>
 <script>
-let ADM = '';
-let _lastKey = '';
-
-// ── Helpers ──
-function toast(msg, type='ok'){
-  const el = document.getElementById('toast');
-  el.className = 'toast ' + type;
-  el.innerHTML = (type==='ok'?'✅':type==='err'?'❌':'ℹ️') + ' <span>' + msg + '</span>';
+let ADM=''; let _lastKey='';
+function toast(msg,type='ok'){
+  const el=document.getElementById('toast');
+  el.className='toast '+type;
+  el.innerHTML=(type==='ok'?'✅':type==='err'?'❌':'ℹ️')+' <span>'+msg+'</span>';
   el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'), 3500);
+  setTimeout(()=>el.classList.remove('show'),3500);
 }
-
-function copyText(text, label){
+function copyText(text,label){
   navigator.clipboard.writeText(text).then(()=>toast((label||'Text')+' copied!'))
-  .catch(()=>{
-    const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);
-    ta.select();document.execCommand('copy');document.body.removeChild(ta);
-    toast((label||'Text')+' copied!');
-  });
+  .catch(()=>{const ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);toast((label||'Text')+' copied!');});
 }
-function copyKey(){ if(_lastKey) copyText(_lastKey,'API Key'); }
-
-async function api(path, method='GET', body=null){
-  try {
-    const r = await fetch(path, {
-      method,
-      headers: {'Content-Type':'application/json'},
-      body: body ? JSON.stringify({...body, key: ADM}) : null,
-      credentials: 'include'
-    });
-    if(method==='GET'){
-      const sep = path.includes('?') ? '&' : '?';
-      const r2 = await fetch(path + sep + 'key=' + ADM, {credentials:'include'});
-      return r2.json();
-    }
-    return r.json();
-  } catch(e){ return {success:false, error:'Network error'}; }
-}
-
+function copyKey(){if(_lastKey)copyText(_lastKey,'API Key');}
 async function apiGet(path){
-  try{
-    const sep = path.includes('?') ? '&' : '?';
-    const r = await fetch(path + sep + 'key=' + ADM, {credentials:'include'});
-    return r.json();
-  }catch(e){return {success:false,error:'Network error'};}
+  try{const sep=path.includes('?')?'&':'?';const r=await fetch(path+sep+'key='+ADM,{credentials:'include'});return r.json();}
+  catch(e){return{success:false,error:'Network error'};}
 }
-
-async function apiPost(path, body){
-  try{
-    const r = await fetch(path, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({...body, key: ADM}),
-      credentials:'include'
-    });
-    return r.json();
-  }catch(e){return {success:false,error:'Network error'};}
+async function apiPost(path,body){
+  try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,key:ADM}),credentials:'include'});return r.json();}
+  catch(e){return{success:false,error:'Network error'};}
 }
-
-// ── Login / Logout ──
 async function doLogin(){
-  const key = document.getElementById('loginKey').value.trim();
-  if(!key){ document.getElementById('loginErr').textContent='Enter your admin key'; return; }
-  const btn = document.querySelector('.login-btn');
-  btn.disabled=true; btn.textContent='🔄 Checking...';
+  const key=document.getElementById('loginKey').value.trim();
+  if(!key){document.getElementById('loginErr').textContent='Enter your admin key';return;}
+  const btn=document.querySelector('.login-btn');btn.disabled=true;btn.textContent='🔄 Checking...';
   try{
-    const r = await fetch('/admin/login',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key}),
-      credentials:'include'
-    });
-    const d = await r.json();
-    if(d.success){
-      ADM = key;
-      document.getElementById('loginPage').style.display='none';
-      document.getElementById('mainPanel').style.display='block';
-      loadAll();
-    } else {
-      document.getElementById('loginErr').textContent='❌ Wrong admin key';
-    }
-  }catch(e){
-    document.getElementById('loginErr').textContent='Network error';
-  }
-  btn.disabled=false; btn.textContent='🔐 Login';
+    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key}),credentials:'include'});
+    const d=await r.json();
+    if(d.success){ADM=key;document.getElementById('loginPage').style.display='none';document.getElementById('mainPanel').style.display='block';loadAll();}
+    else document.getElementById('loginErr').textContent='❌ Wrong admin key';
+  }catch(e){document.getElementById('loginErr').textContent='Network error';}
+  btn.disabled=false;btn.textContent='🔐 Login';
 }
-
 async function doLogout(){
   await fetch('/admin/logout',{method:'POST',credentials:'include'});
-  ADM='';
-  document.getElementById('mainPanel').style.display='none';
-  document.getElementById('loginPage').style.display='flex';
-  document.getElementById('loginKey').value='';
+  ADM='';document.getElementById('mainPanel').style.display='none';document.getElementById('loginPage').style.display='flex';document.getElementById('loginKey').value='';
 }
-
-// ── Stats ──
 async function loadStats(){
-  const d = await apiGet('/admin/stats');
-  if(!d.success) return;
-  document.getElementById('st-keys').textContent  = d.total_keys ?? '—';
-  document.getElementById('st-accs').textContent  = d.total_accounts ?? '—';
-  document.getElementById('st-pend').textContent  = d.pending ?? '—';
-  document.getElementById('st-cache').textContent = d.cache?.valid ?? '—';
-  document.getElementById('st-hits').textContent  = d.stats?.cache_hits ?? '—';
-  document.getElementById('cacheValid').textContent = d.cache?.valid ?? '—';
-  document.getElementById('cacheTotal').textContent = d.cache?.total ?? '—';
-  document.getElementById('cacheTtl').textContent   = (d.cache?.ttl_hours ?? '—') + 'h';
-  const inp = document.getElementById('cfgBotUn');
-  if(inp && !inp.value) inp.value = d.bot_username || '';
-  const inp2 = document.getElementById('cfgLeakBot');
-  if(inp2 && !inp2.value) inp2.value = d.leak_bot || '';
+  const d=await apiGet('/admin/stats');if(!d.success)return;
+  document.getElementById('st-keys').textContent=d.total_keys??'—';
+  document.getElementById('st-accs').textContent=d.total_accounts??'—';
+  document.getElementById('st-pend').textContent=d.pending??'—';
+  document.getElementById('st-cache').textContent=d.cache?.valid??'—';
+  document.getElementById('st-hits').textContent=d.stats?.cache_hits??'—';
+  document.getElementById('cacheValid').textContent=d.cache?.valid??'—';
+  document.getElementById('cacheTotal').textContent=d.cache?.total??'—';
+  document.getElementById('cacheTtl').textContent=(d.cache?.ttl_hours??'—')+'h';
+  const inp=document.getElementById('cfgBotUn');if(inp&&!inp.value)inp.value=d.bot_username||'';
+  const inp2=document.getElementById('cfgLeakBot');if(inp2&&!inp2.value)inp2.value=d.leak_bot||'';
 }
-
 async function saveConfig(){
-  const val  = document.getElementById('cfgBotUn').value.trim();
-  const val2 = document.getElementById('cfgLeakBot').value.trim();
-  if(!val){ toast('Enter a bot username','err'); return; }
-  const d = await apiPost('/admin/config',{bot_username:val, leak_bot:val2});
-  if(d.success){ toast('Settings saved!','ok'); loadStats(); }
-  else toast(d.error||'Failed','err');
+  const val=document.getElementById('cfgBotUn').value.trim();
+  const val2=document.getElementById('cfgLeakBot').value.trim();
+  if(!val){toast('Enter a bot username','err');return;}
+  const d=await apiPost('/admin/config',{bot_username:val,leak_bot:val2});
+  if(d.success){toast('Settings saved!','ok');loadStats();}else toast(d.error||'Failed','err');
 }
-
 async function clearCache(){
-  if(!confirm('Clear all cached results?')) return;
-  const d = await apiPost('/admin/cache/clear',{});
-  if(d.success){ toast('Cache cleared','ok'); loadStats(); }
-  else toast(d.error||'Failed','err');
+  if(!confirm('Clear all cached results?'))return;
+  const d=await apiPost('/admin/cache/clear',{});
+  if(d.success){toast('Cache cleared','ok');loadStats();}else toast(d.error||'Failed','err');
 }
-
-// ── Keys ──
 async function loadKeys(){
-  const d  = await apiGet('/admin/keys');
-  const tb = document.getElementById('keysTbl');
-  if(!d.success){ tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="ei">🔐</div><p>Auth failed</p></div></td></tr>'; return; }
-  if(!d.keys.length){ tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="ei">🗝️</div><p>No API keys</p></div></td></tr>'; return; }
-  tb.innerHTML = d.keys.map(k=>{
-    const expiry = k.expiry ? k.expiry.split('T')[0] : '<span style="color:#4ade80">Forever</span>';
-    const limit  = k.daily_limit > 0 ? k.daily_limit : '<span style="color:#4ade80">∞</span>';
-    const sk = k.key.slice(0,8)+'...'+k.key.slice(-4);
-    return `<tr>
-      <td><div class="key-cell"><span class="key-code" title="${k.key}" onclick="copyText('${k.key}','API Key')">${sk}</span><span class="copy-icon" onclick="copyText('${k.key}','API Key')">📋</span></div></td>
-      <td><b style="color:#e2e2f0">${k.name}</b></td>
-      <td>${expiry}</td><td>${limit}</td>
-      <td><span class="badge blue">${k.uses}</span></td>
-      <td><span class="badge ${k.active?'green':'red'}">${k.active?'● Active':'● Off'}</span></td>
-      <td><button class="danger sm" onclick="delKey('${k.key}')">Revoke</button></td>
-    </tr>`;
+  const d=await apiGet('/admin/keys');const tb=document.getElementById('keysTbl');
+  if(!d.success){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="ei">🔐</div><p>Auth failed</p></div></td></tr>';return;}
+  if(!d.keys.length){tb.innerHTML='<tr><td colspan="7"><div class="empty"><div class="ei">🗝️</div><p>No API keys</p></div></td></tr>';return;}
+  tb.innerHTML=d.keys.map(k=>{
+    const expiry=k.expiry?k.expiry.split('T')[0]:'<span style="color:#4ade80">Forever</span>';
+    const limit=k.daily_limit>0?k.daily_limit:'<span style="color:#4ade80">∞</span>';
+    const sk=k.key.slice(0,8)+'...'+k.key.slice(-4);
+    return`<tr><td><div class="key-cell"><span class="key-code" title="${k.key}" onclick="copyText('${k.key}','API Key')">${sk}</span><span class="copy-icon" onclick="copyText('${k.key}','API Key')">📋</span></div></td><td><b style="color:#e2e2f0">${k.name}</b></td><td>${expiry}</td><td>${limit}</td><td><span class="badge blue">${k.uses}</span></td><td><span class="badge ${k.active?'green':'red'}">${k.active?'● Active':'● Off'}</span></td><td><button class="danger sm" onclick="delKey('${k.key}')">Revoke</button></td></tr>`;
   }).join('');
 }
-
 async function genKey(){
-  const name  = document.getElementById('kName').value.trim();
-  const days  = parseInt(document.getElementById('kDays').value)||0;
-  const limit = parseInt(document.getElementById('kLimit').value)||0;
-  if(!name){ toast('Enter a key name','err'); return; }
-  const btn = event.target.closest('button');
-  btn.disabled=true; btn.textContent='⏳...';
-  const d = await apiPost('/admin/keys/create',{name,days,daily_limit:limit});
-  btn.disabled=false; btn.innerHTML='⚡ Generate Key';
-  if(d.success){
-    _lastKey=d.key;
-    document.getElementById('keyDisplay').textContent=d.key;
-    document.getElementById('keyMeta').innerHTML=
-      `<span>👤 ${name}</span><span>📅 ${d.expiry?'Expires '+d.expiry.split('T')[0]:'Never'}</span><span>🔢 ${limit>0?limit+'/day':'Unlimited'}</span>`;
-    document.getElementById('keyResult').classList.add('show');
-    toast('Key generated for '+name,'ok'); loadKeys(); loadStats();
-  } else toast(d.error||'Failed','err');
+  const name=document.getElementById('kName').value.trim();
+  const days=parseInt(document.getElementById('kDays').value)||0;
+  const limit=parseInt(document.getElementById('kLimit').value)||0;
+  if(!name){toast('Enter a key name','err');return;}
+  const btn=event.target.closest('button');btn.disabled=true;btn.textContent='⏳...';
+  const d=await apiPost('/admin/keys/create',{name,days,daily_limit:limit});
+  btn.disabled=false;btn.innerHTML='⚡ Generate Key';
+  if(d.success){_lastKey=d.key;document.getElementById('keyDisplay').textContent=d.key;document.getElementById('keyMeta').innerHTML=`<span>👤 ${name}</span><span>📅 ${d.expiry?'Expires '+d.expiry.split('T')[0]:'Never'}</span><span>🔢 ${limit>0?limit+'/day':'Unlimited'}</span>`;document.getElementById('keyResult').classList.add('show');toast('Key generated for '+name,'ok');loadKeys();loadStats();}
+  else toast(d.error||'Failed','err');
 }
-
 async function delKey(key){
-  if(!confirm('Revoke this key?')) return;
-  const d = await apiPost('/admin/keys/revoke',{key});
-  if(d.success){ toast('Key revoked','ok'); loadKeys(); loadStats(); }
-  else toast(d.error||'Failed','err');
+  if(!confirm('Revoke this key?'))return;
+  const d=await apiPost('/admin/keys/revoke',{key});
+  if(d.success){toast('Key revoked','ok');loadKeys();loadStats();}else toast(d.error||'Failed','err');
 }
-
-// ── Accounts ──
 async function loadAccounts(){
-  const d  = await apiGet('/admin/accounts');
-  const tb = document.getElementById('accsTbl');
-  if(!d.success){ tb.innerHTML='<tr><td colspan="5"><div class="empty"><div class="ei">🔐</div><p>Auth failed</p></div></td></tr>'; return; }
-  if(!d.accounts.length){ tb.innerHTML='<tr><td colspan="5"><div class="empty"><div class="ei">👤</div><p>No accounts</p></div></td></tr>'; return; }
-  tb.innerHTML = d.accounts.map(a=>`
-    <tr>
-      <td><b style="color:#e2e2f0">${a.name}</b></td>
-      <td><span class="badge blue">${a.api_id}</span></td>
-      <td><span class="badge ${a.active?'green':'red'}">${a.active?'● Active':'● Off'}</span></td>
-      <td><span class="badge ${a.connected?'green':'red'}">${a.connected?'🟢 Online':'🔴 Offline'}</span></td>
-      <td style="display:flex;gap:6px">
-        <button class="success sm" onclick="startAcc(${a.id})">▶ Start</button>
-        <button class="danger sm" onclick="delAcc(${a.id})">✕ Remove</button>
-      </td>
-    </tr>`).join('');
+  const d=await apiGet('/admin/accounts');const tb=document.getElementById('accsTbl');
+  if(!d.success){tb.innerHTML='<tr><td colspan="5"><div class="empty"><div class="ei">🔐</div><p>Auth failed</p></div></td></tr>';return;}
+  if(!d.accounts.length){tb.innerHTML='<tr><td colspan="5"><div class="empty"><div class="ei">👤</div><p>No accounts</p></div></td></tr>';return;}
+  tb.innerHTML=d.accounts.map(a=>`<tr><td><b style="color:#e2e2f0">${a.name}</b></td><td><span class="badge blue">${a.api_id}</span></td><td><span class="badge ${a.active?'green':'red'}">${a.active?'● Active':'● Off'}</span></td><td><span class="badge ${a.connected?'green':'red'}">${a.connected?'🟢 Online':'🔴 Offline'}</span></td><td style="display:flex;gap:6px"><button class="success sm" onclick="startAcc(${a.id})">▶ Start</button><button class="danger sm" onclick="delAcc(${a.id})">✕ Remove</button></td></tr>`).join('');
 }
-
 async function addAccount(){
-  const name=document.getElementById('aName').value.trim();
-  const api_id=document.getElementById('aApiId').value.trim();
-  const api_hash=document.getElementById('aApiHash').value.trim();
-  const session_string=document.getElementById('aSession').value.trim();
-  if(!name||!api_id||!api_hash||!session_string){ toast('Fill all fields','err'); return; }
-  const btn=event.target.closest('button');
-  btn.disabled=true; btn.textContent='⏳ Adding...';
+  const name=document.getElementById('aName').value.trim();const api_id=document.getElementById('aApiId').value.trim();
+  const api_hash=document.getElementById('aApiHash').value.trim();const session_string=document.getElementById('aSession').value.trim();
+  if(!name||!api_id||!api_hash||!session_string){toast('Fill all fields','err');return;}
+  const btn=event.target.closest('button');btn.disabled=true;btn.textContent='⏳ Adding...';
   const d=await apiPost('/admin/accounts/add',{name,api_id,api_hash,session_string});
-  btn.disabled=false; btn.innerHTML='➕ Add Account';
-  if(d.success){
-    toast('Account added!','ok'); loadAccounts(); loadStats();
-    ['aName','aApiId','aApiHash','aSession'].forEach(id=>document.getElementById(id).value='');
-  } else toast(d.error||'Failed','err');
-}
-
-async function startAcc(id){
-  const d=await apiPost('/admin/accounts/start',{id});
-  if(d&&d.success) toast('Account started!','ok');
-  else toast('Start: '+(d&&d.error?d.error:'Restart if needed'),'info');
-  setTimeout(loadAccounts,2000);
-}
-
-async function delAcc(id){
-  if(!confirm('Remove this account?')) return;
-  const d=await apiPost('/admin/accounts/remove',{id});
-  if(d.success){ toast('Account removed','ok'); loadAccounts(); loadStats(); }
+  btn.disabled=false;btn.innerHTML='➕ Add Account';
+  if(d.success){toast('Account added!','ok');loadAccounts();loadStats();['aName','aApiId','aApiHash','aSession'].forEach(id=>document.getElementById(id).value='');}
   else toast(d.error||'Failed','err');
 }
-
-function loadAll(){ loadStats(); loadKeys(); loadAccounts(); }
-setInterval(()=>{ if(ADM) loadStats(); }, 15000);
+async function startAcc(id){const d=await apiPost('/admin/accounts/start',{id});if(d&&d.success)toast('Account started!','ok');else toast('Start: '+(d&&d.error?d.error:'Restart if needed'),'info');setTimeout(loadAccounts,2000);}
+async function delAcc(id){if(!confirm('Remove this account?'))return;const d=await apiPost('/admin/accounts/remove',{id});if(d.success){toast('Account removed','ok');loadAccounts();loadStats();}else toast(d.error||'Failed','err');}
+function loadAll(){loadStats();loadKeys();loadAccounts();}
+setInterval(()=>{if(ADM)loadStats();},15000);
 </script>
 </body>
 </html>"""
@@ -1829,8 +2018,9 @@ async def start_all_clients():
                 print(f"[ACC] {row['name']} — NOT authorized"); continue
             acc_manager.set_client(row["id"], client)
             client.add_event_handler(on_message)
-            client.add_event_handler(on_leak_message)
-            client.add_event_handler(on_leak_edited)
+            client.add_event_handler(on_leak_document)   # HTML fast path (NEW)
+            client.add_event_handler(on_leak_message)    # Text fallback
+            client.add_event_handler(on_leak_edited)     # Text edit fallback
             print(f"[ACC] {row['name']} — connected OK")
         except Exception as e:
             print(f"[ACC] {row['name']} — failed: {e}")
@@ -1850,5 +2040,6 @@ if __name__ == '__main__':
     t.start()
     while loop is None: time.sleep(0.1)
     port = int(os.environ.get("PORT", 5000))
-    print(f"[RAJFF API] Starting on port {port}")
+    print(f"[RAJFF API v3.0] Starting on port {port}")
+    print(f"[RAJFF API] Bot: {BOT_USERNAME} | Dev: {DEVELOPER_TAG}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
