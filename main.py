@@ -34,8 +34,9 @@ TRUECALLER_BOT = "@Truecaller_redbot"
 NICK_BOT       = "@Nick_Bypass_Bot"
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "@RAJFFLIVEBOT")
 LEAK_BOT       = os.environ.get("LEAK_BOT", "")
-DEVELOPER_TAG  = os.environ.get("DEVELOPER_TAG", "👤 @RAJFFLIVE | 📢 t.me/RAJFFLIVE")
+DEVELOPER_TAG  = os.environ.get("DEVELOPER_TAG", "@RAJFFLIVE")
 BOT_TAG        = os.environ.get("BOT_TAG", "@RAJFFLIVEBOT")
+CHANNEL_LINK   = os.environ.get("CHANNEL_LINK", "https://t.me/+QUg-JvyJizkxMzA1")
 CACHE_TTL      = int(os.environ.get("CACHE_TTL", 86400))  # seconds, default 24h
 
 logging.basicConfig(level=logging.INFO)
@@ -984,13 +985,13 @@ async def on_leak_edited(event):
     await _process_leak_text_event(event, is_edit=True)
 
 
-# ==================== BOT FOOTER (added to every leak response) ====================
+# ==================== BOT FOOTER (added to every response) ====================
 def make_footer():
-    """Return the bot/dev attribution block for every response."""
+    """Bot attribution — appears at bottom of every API response."""
     return {
-        "bot": get_bot_username(),
-        "developer": DEVELOPER_TAG,
-        "channel": "t.me/RAJFFLIVE"
+        "🤖 Bot":      get_bot_username(),
+        "👨‍💻 Dev":     f"@{DEVELOPER_TAG.lstrip('@')}",
+        "📢 Channel":  CHANNEL_LINK,
     }
 
 
@@ -1065,87 +1066,92 @@ def leak_lookup():
             **make_footer()
         }), 500
 
-    def _source_tag():
-        """Attribution tag string placed before and after every source block."""
-        bot  = get_bot_username()          # e.g. @RAJFFLIVEBOT
-        dev  = DEVELOPER_TAG               # e.g. 👤 @RAJFFLIVE | 📢 t.me/RAJFFLIVE
-        return f"🤖 {bot} | {dev}"
+    # ── Field-level emoji map ──
+    _FIELD_EMOJI = {
+        "telephone": "📞", "phone": "📞", "mobile": "📞",
+        "email": "📧", "mail": "📧",
+        "full name": "👤", "name": "👤",
+        "father": "👨", "parent": "👨",
+        "address": "🏠", "adres": "🏠", "addr": "🏠",
+        "document": "📄", "doc": "📄", "cnic": "📄",
+        "region": "📍", "city": "🏙️", "state": "📍",
+        "country": "🌍",
+        "ip": "🌐",
+        "password": "🔐", "hash": "🔐", "encrypted": "🔐",
+        "date": "📅", "birth": "📅", "registration": "📅",
+        "username": "💬", "nick": "💬", "login": "💬",
+        "currency": "💰", "sum": "💰", "amount": "💰",
+        "gender": "👫", "sex": "👫",
+        "taled": "⏱️", "time": "⏱️",
+    }
+
+    def _emoji_for(key):
+        kl = key.lower()
+        for kw, em in _FIELD_EMOJI.items():
+            if kw in kl:
+                return em
+        return "•"
+
+    def _fmt_records(records):
+        """Add emoji prefix to every field key; strip internal _ fields."""
+        out = []
+        for rec in records:
+            row = {}
+            for k, v in rec.items():
+                if k.startswith("_"):
+                    continue
+                row[f"{_emoji_for(k)} {k}"] = v
+            if row:
+                out.append(row)
+        return out
 
     def _format_sources(sources):
-        """Wrap every source with tag_before / tag_after attribution."""
-        tag = _source_tag()
+        """Format sources list — clean, emoji-labelled, no per-source tags."""
         out = []
         for src in sources:
-            out.append({
-                "tag_before":  tag,
-                "source":      src.get("source_clean") or src.get("source"),
-                "description": src.get("description", ""),
-                "records":     src.get("records", []),
-                "tag_after":   tag,
-            })
+            records = _fmt_records(src.get("records", []))
+            desc = src.get("description", "").strip()
+            entry = {
+                "🗄️ Source":  src.get("source_clean") or src.get("source", "Unknown"),
+                "📝 About":   desc[:280] + ("…" if len(desc) > 280 else ""),
+                "📊 Records": len(records),
+                "📋 Data":    records,
+            }
+            out.append(entry)
         return out
 
     def build_html_response(req, elapsed):
-        """Build response from parsed HTML (fast path)."""
+        """Build clean JSON from parsed HTML (fast path)."""
         sources  = req.get("html_sources") or []
         all_recs = req.get("html_records") or []
-
-        nav_labels = {
-            "▶","▶️","◀","◀️",
-            "←","→","<",">","<<",">>",
-            "➡","➡️","⬅","⬅️",
-            "⇒","⇐","Next","next","Prev","prev"
-        }
-        _page_re = re.compile(r"^\d+\\?\d+$")
-        final_btns = [
-            b for b in req.get("buttons", [])
-            if b.get("text","").strip() not in nav_labels
-            and not _page_re.match(b.get("text","").strip())
-        ]
-
         return {
-            "status": True,
-            "query":  query,
-            "data": {
-                "mode":           "html",
-                "total_records":  len(all_recs),
-                "sources_count":  len(sources),
-                "sources":        _format_sources(sources),
-                "action_buttons": final_btns,
+            "✅ Status":        True,
+            "🔍 Query":         query,
+            "📊 Summary": {
+                "🗂️ Sources Found":  len(sources),
+                "📁 Total Records":  len(all_recs),
+                "⚡ Mode":           "HTML (Fast)",
             },
-            "response_time": elapsed,
+            "📂 Results":       _format_sources(sources),
+            "⏱️ Response Time": elapsed,
             **make_footer()
         }
 
     def build_text_response(req, elapsed):
-        """Build response from text fallback (paginated text pages)."""
-        messages = req.get("messages") or []
-        nav_labels = {
-            "▶","▶️","◀","◀️",
-            "←","→","<",">","<<",">>",
-            "➡","➡️","⬅","⬅️",
-            "⇒","⇐","Next","next","Prev","prev"
-        }
-        _page_re = re.compile(r"^\d+\\?\d+$")
-        final_btns = [
-            b for b in req.get("buttons", [])
-            if b.get("text","").strip() not in nav_labels
-            and not _page_re.match(b.get("text","").strip())
-        ]
+        """Build clean JSON from text fallback."""
+        messages    = req.get("messages") or []
         all_text    = "\n\n".join(messages)
         all_records, sources = parse_leak_text(all_text)
-
         return {
-            "status": True,
-            "query":  query,
-            "data": {
-                "mode":           "text",
-                "total_records":  len(all_records),
-                "sources_count":  len(sources),
-                "sources":        _format_sources(sources),
-                "action_buttons": final_btns,
+            "✅ Status":        True,
+            "🔍 Query":         query,
+            "📊 Summary": {
+                "🗂️ Sources Found": len(sources),
+                "📁 Total Records": len(all_records),
+                "⚡ Mode":          "Text (Fallback)",
             },
-            "response_time": elapsed,
+            "📂 Results":       _format_sources(sources),
+            "⏱️ Response Time": elapsed,
             **make_footer()
         }
 
@@ -1468,9 +1474,9 @@ def home():
                 "/leak":  "Leak database lookup (?q=NUMBER_OR_EMAIL&key=KEY)",
                 "/api/tg":"Telegram username/ID lookup (?tg=@username&key=KEY)"
             },
-            "bot":       bot_un,
-            "developer": DEVELOPER_TAG,
-            "channel":   "t.me/RAJFFLIVE"
+            "🤖 Bot":     bot_un,
+            "👨‍💻 Dev":    f"@{DEVELOPER_TAG.lstrip('@')}",
+            "📢 Channel": CHANNEL_LINK
         }, ensure_ascii=False),
         mimetype='application/json'
     )
