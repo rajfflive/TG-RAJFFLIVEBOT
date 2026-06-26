@@ -31,6 +31,7 @@ TRUECALLER_BOT = "@Truecaller_redbot"
 NICK_BOT       = "@Nick_Bypass_Bot"
 BOT_USERNAME   = os.environ.get("BOT_USERNAME", "@RAJFFLIVEBOT")
 LEAK_BOT       = os.environ.get("LEAK_BOT", "")
+DEVELOPER_TAG  = os.environ.get("DEVELOPER_TAG", "👤 @RAJFFLIVE | 📢 t.me/RAJFFLIVE")
 CACHE_TTL      = int(os.environ.get("CACHE_TTL", 86400))  # seconds, default 24h
 
 logging.basicConfig(level=logging.INFO)
@@ -212,7 +213,7 @@ def require_key(f):
     def decorated(*args, **kwargs):
         key = request.args.get("key", "")
         if key != API_KEY and not check_api_key(key):
-            return jsonify({"success": False, "error": "Invalid or expired API key"}), 401
+            return jsonify({"status": False, "error": "Invalid or expired API key", "developer": DEVELOPER_TAG}), 401
         return f(*args, **kwargs)
     return decorated
 
@@ -335,7 +336,7 @@ def parse_response(text, number):
     country = "Pakistan" if len(clean_num(number)) == 11 else "India"
     return {
         "_status":       "OK",
-        "success":       True,
+        "status":        True,
         "country":       country,
         "number":        number,
         "total_records": len(records),
@@ -476,36 +477,112 @@ async def on_message(event):
     pending[matched_id]["result"] = result
     pending[matched_id]["done"]   = True
 
-# ==================== LEAK EVENT HANDLER ====================
-@events.register(events.NewMessage)
-async def on_leak_message(event):
-    msg = event.message
-    if not msg or not msg.text: return
-    sender = await event.get_sender()
-    uname  = (getattr(sender, 'username', '') or "").lower()
-    lb     = get_leak_bot().lstrip('@').lower()
-    if not lb or lb not in uname: return
+# ==================== LEAK AUTO-PAGINATOR ====================
+async def auto_paginate(req_id, msg, client, max_pages=30):
+    """Click ▶ button on each page until no more next page or max reached."""
+    NEXT_LABELS = {"▶", "▶️", "→", "Next", "next", ">", ">>"}
+    seen_texts  = set()
 
-    matched_id = None; oldest_ts = float('inf')
-    for rid, req in list(leak_pending.items()):
-        if req.get("done"): continue
-        age = time.time() - req["ts"]
-        if age > 180: leak_pending.pop(rid, None); continue
-        if req["ts"] < oldest_ts: oldest_ts = req["ts"]; matched_id = rid
-    if not matched_id: return
+    for page_num in range(max_pages):
+        if req_id not in leak_pending: return
 
-    txt = msg.text or ""
+        # Find ▶ button row/col
+        next_row = next_col = None
+        try:
+            if msg.buttons:
+                for ri, row in enumerate(msg.buttons):
+                    for ci, btn in enumerate(row):
+                        if btn.text.strip() in NEXT_LABELS:
+                            next_row, next_col = ri, ci
+                            break
+        except Exception:
+            pass
 
-    # Skip first "summary" message from bot — wait for actual data
-    is_summary = any(x in txt for x in [
-        "A lot of results were found", "No results found",
-        "Request:", "Subjects made:", "The number of leaks:",
-        "Search time:", "You are shown", "free version"
-    ])
-    if is_summary:
-        return  # ignore — actual data comes in next message(s)
+        if next_row is None:
+            # No ▶ found — we're on the last page
+            leak_pending[req_id]["done"] = True
+            return
 
-    # Capture inline keyboard buttons
+        # Click ▶
+        try:
+            await msg.click(next_row, next_col)
+        except Exception as e:
+            print(f"[PAGINATE] click error: {e}")
+            leak_pending[req_id]["done"] = True
+            return
+
+        # Wait for bot to edit/send response (up to 8 seconds)
+        for _ in range(40):
+            await asyncio.sleep(0.2)
+            req = leak_pending.get(req_id, {})
+            new_msg = req.get("current_msg")
+            if new_msg and new_msg.id != msg.id:
+                msg = new_msg; break
+            elif new_msg and new_msg.id == msg.id:
+                # Could be edit — check if text changed
+                new_txt = (getattr(new_msg, 'text', '') or '')
+                if new_txt not in seen_texts and new_txt:
+                    msg = new_msg; break
+        else:
+            # Timeout waiting for next page
+            leak_pending[req_id]["done"] = True
+            return
+
+        seen_texts.add(msg.text or "")
+
+    # Hit max pages
+    leak_pending[req_id]["done"] = True
+
+# ==================== LEAK TEXT PARSER ====================
+def parse_leak_text(all_text):
+    """
+    Parse raw leak bot text into structured records.
+    Handles: 'Key - value', 'Key: value', 'Key | value' formats.
+    Splits records by blank lines or separator lines.
+    """
+    FIELD_KEYS = ['email','password','phone','nick','login','link',
+                  'name','number','ip','hash','username','url','app',
+                  'appmobileordesktopapplication','domain','source']
+
+    def is_separator(line):
+        return bool(re.match(r'^[\-=_\*~•\s]{2,}$', line)) or line.strip() == ''
+
+    def extract_fields(block_lines):
+        rec = {}
+        for line in block_lines:
+            line = line.strip()
+            if not line or is_separator(line): continue
+            # Try Key - value OR Key: value
+            m = re.match(r'^([A-Za-z][A-Za-z0-9_\s]{0,30})\s*[\-:]\s*(.+)$', line)
+            if m:
+                key = m.group(1).strip().title().replace(' ','')
+                val = m.group(2).strip()
+                if key.lower().replace(' ','') in FIELD_KEYS and val:
+                    rec[key] = val
+        return rec if rec else None
+
+    lines = all_text.split('\n')
+    records = []
+    current_block = []
+
+    for line in lines:
+        if is_separator(line):
+            if current_block:
+                rec = extract_fields(current_block)
+                if rec: records.append(rec)
+                current_block = []
+        else:
+            current_block.append(line)
+    if current_block:
+        rec = extract_fields(current_block)
+        if rec: records.append(rec)
+
+    return records
+
+# ==================== LEAK SHARED MESSAGE PROCESSOR ====================
+NEXT_BTN_LABELS = {"▶", "▶️", "→", "Next", "next", ">", ">>"}
+
+def _extract_buttons(msg):
     buttons_data = []
     try:
         if msg.buttons:
@@ -519,10 +596,80 @@ async def on_leak_message(event):
                     buttons_data.append(b)
     except Exception:
         pass
+    return buttons_data
 
-    leak_pending[matched_id]["raw"]     = txt
-    leak_pending[matched_id]["buttons"] = buttons_data
-    leak_pending[matched_id]["done"]    = True
+async def _process_leak_event(event, is_edit=False):
+    msg = event.message
+    if not msg: return
+    txt = msg.text or ""
+    if not txt: return
+
+    sender = await event.get_sender()
+    uname  = (getattr(sender, 'username', '') or "").lower()
+    lb     = get_leak_bot().lstrip('@').lower()
+    if not lb or lb not in uname: return
+
+    # Find the oldest pending (not done) request
+    matched_id = None; oldest_ts = float('inf')
+    for rid, req in list(leak_pending.items()):
+        if req.get("done"): continue
+        age = time.time() - req["ts"]
+        if age > 180: leak_pending.pop(rid, None); continue
+        if req["ts"] < oldest_ts: oldest_ts = req["ts"]; matched_id = rid
+    if not matched_id: return
+
+    # Skip pure summary/stats messages (no actual data fields)
+    has_summary = any(x in txt for x in [
+        "A lot of results were found", "Subjects made:",
+        "The number of leaks:", "Search time:", "You are shown"
+    ])
+    has_data = bool(re.search(
+        r'(Email|Password|Phone|Nick|Link|Name|Address|CNIC|Number|Login|IP|Hash|Username)\s*[\-:\|]',
+        txt, re.IGNORECASE
+    ))
+    if has_summary and not has_data:
+        return  # pure stats summary — skip
+
+    buttons_data = _extract_buttons(msg)
+    has_next     = any(b["text"].strip() in NEXT_BTN_LABELS for b in buttons_data)
+
+    # Accumulate page text (deduplicate)
+    req = leak_pending[matched_id]
+    if "messages" not in req:
+        req["messages"] = []
+    seen = req.get("seen_texts", set())
+    if txt not in seen:
+        req["messages"].append(txt)
+        seen.add(txt)
+        req["seen_texts"] = seen
+
+    req["current_msg"] = msg      # paginator uses this
+    req["buttons"]     = buttons_data
+    req["has_data"]    = True
+
+    # If has ▶ and not already paginating → start auto-paginator
+    if has_next and not req.get("paginating"):
+        req["paginating"] = True
+        # Find which client has access to this msg
+        client = None
+        for aid in acc_manager.get_active_ids():
+            c = acc_manager.get_client(aid)
+            if c and c.is_connected():
+                client = c; break
+        if client:
+            asyncio.create_task(auto_paginate(matched_id, msg, client))
+    elif not has_next:
+        # Last page — no more ▶
+        req["done"] = True
+
+# ==================== LEAK EVENT HANDLER ====================
+@events.register(events.NewMessage)
+async def on_leak_message(event):
+    await _process_leak_event(event, is_edit=False)
+
+@events.register(events.MessageEdited)
+async def on_leak_edited(event):
+    await _process_leak_event(event, is_edit=True)
 
 # ==================== LEAK LOOKUP ====================
 def leak_lookup():
@@ -535,15 +682,15 @@ def leak_lookup():
              request.args.get('number') or request.args.get('text') or
              request.args.get('email') or '').strip()
     if not query:
-        return jsonify({"success": False, "error": "Missing parameter. Use ?q=anything OR ?num=number"}), 400
+        return jsonify({"status": False, "error": "Missing parameter. Use ?q=anything OR ?num=number", "developer": DEVELOPER_TAG}), 400
 
     lb = get_leak_bot()
     if not lb:
-        return jsonify({"success": False, "error": "Leak bot not configured. Set LEAK_BOT env var or configure in admin panel."}), 503
+        return jsonify({"status": False, "error": "Leak bot not configured.", "developer": DEVELOPER_TAG}), 503
 
     acc_id, acc_client = acc_manager.next_client()
     if not acc_client:
-        return jsonify({"success": False, "error": "No active Telegram accounts"}), 503
+        return jsonify({"status": False, "error": "No active Telegram accounts", "developer": DEVELOPER_TAG}), 503
 
     # Build send message
     # If custom fmt provided: use it with {q} or {num} placeholder
@@ -565,7 +712,11 @@ def leak_lookup():
             send_msg = query                             # text/email/other — send as-is
 
     req_id = f"leak_{int(time.time()*1000)}_{re.sub(r'[^a-zA-Z0-9]','_',query)[:20]}"
-    leak_pending[req_id] = {"query": query, "ts": time.time(), "done": False, "raw": None}
+    leak_pending[req_id] = {
+        "query": query, "ts": time.time(), "done": False, "raw": None,
+        "messages": [], "seen_texts": set(), "buttons": [],
+        "has_data": False, "paginating": False
+    }
 
     async def _send():
         await acc_client.send_message(lb, send_msg)
@@ -574,29 +725,48 @@ def leak_lookup():
         asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
     except Exception as e:
         leak_pending.pop(req_id, None)
-        return jsonify({"success": False, "error": f"Send failed: {e}"}), 500
+        return jsonify({"status": False, "error": f"Send failed: {e}", "developer": DEVELOPER_TAG}), 500
 
-    deadline = time.time() + 60
+    def build_leak_response(req, elapsed):
+        messages = req.get("messages") or []
+        buttons  = req.get("buttons", [])
+        # Remove nav buttons (◀/▶) from final response — keep Download/Functions
+        nav_labels = {"▶","▶️","◀","◀️","←","→","<",">","<<",">>"}
+        final_btns = [b for b in buttons if b.get("text","").strip() not in nav_labels]
+        all_text = "\n\n".join(messages)
+        records  = parse_leak_text(all_text)
+        return {
+            "status":        True,
+            "query":         query,
+            "developer":     DEVELOPER_TAG,
+            "data": {
+                "total_records": len(records),
+                "records":       records,
+                "raw_response":  all_text,
+                "action_buttons": final_btns
+            },
+            "response_time": elapsed
+        }
+
+    # Deadline: 120s — enough for full pagination (30 pages × ~3s each)
+    deadline = time.time() + 120
     while time.time() < deadline:
         req = leak_pending.get(req_id, {})
         if req.get("done"):
-            raw = req["raw"]
             leak_pending.pop(req_id, None)
             elapsed = f"{(time.time() - t_start):.2f}s"
-            data = {
-                "success":       True,
-                "query":         query,
-                "response":      raw,
-                "buttons":       req.get("buttons", []),
-                "response_time": elapsed
-            }
-            return _Resp(_json.dumps(data, ensure_ascii=False), mimetype='application/json')
-        time.sleep(0.3)
+            return _Resp(_json.dumps(build_leak_response(req, elapsed), ensure_ascii=False),
+                         mimetype='application/json')
+        time.sleep(0.4)
 
-    leak_pending.pop(req_id, None)
+    # Timeout — return whatever we collected
+    req = leak_pending.pop(req_id, {})
     elapsed = f"{(time.time() - t_start):.2f}s"
-    return jsonify({"success": False, "error": "Timeout — leak bot didn't respond in 60s",
-                    "response_time": elapsed}), 504
+    if req.get("has_data"):
+        return _Resp(_json.dumps(build_leak_response(req, elapsed), ensure_ascii=False),
+                     mimetype='application/json')
+    return jsonify({"status": False, "error": "Timeout — leak bot didn't respond",
+                    "developer": DEVELOPER_TAG, "response_time": elapsed}), 504
 
 @app.route('/leak', methods=['GET'])
 @require_key
@@ -610,12 +780,12 @@ def api_leak():
 def api_india():
     number = (request.args.get('num') or request.args.get('number', '')).strip()
     if not number:
-        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+        return jsonify({"status": False, "error": "Missing num parameter", "developer": DEVELOPER_TAG}), 400
     digits = re.sub(r'[^\d]', '', number)
     if len(digits) == 12 and digits.startswith('91'):
         digits = digits[2:]
     if len(digits) != 10:
-        return jsonify({"success": False, "error": "Indian number format galat hai. 10 digit ya +91XXXXXXXXXX dein"}), 400
+        return jsonify({"status": False, "error": "Indian number format galat hai. 10 digit ya +91XXXXXXXXXX dein", "developer": DEVELOPER_TAG}), 400
     g.override_num = digits
     return num_lookup()
 
@@ -624,12 +794,12 @@ def api_india():
 def api_pakistan():
     number = (request.args.get('num') or request.args.get('number', '')).strip()
     if not number:
-        return jsonify({"success": False, "error": "Missing num parameter"}), 400
+        return jsonify({"status": False, "error": "Missing num parameter", "developer": DEVELOPER_TAG}), 400
     digits = re.sub(r'[^\d]', '', number)
     if len(digits) == 12 and digits.startswith('92'):
         digits = '0' + digits[2:]
     if not (len(digits) == 11 and digits.startswith('03')):
-        return jsonify({"success": False, "error": "Pakistani number format galat hai. 03XXXXXXXXX ya +923XXXXXXXX dein"}), 400
+        return jsonify({"status": False, "error": "Pakistani number format galat hai. 03XXXXXXXXX ya +923XXXXXXXX dein", "developer": DEVELOPER_TAG}), 400
     g.override_num = digits
     return num_lookup()
 
@@ -638,11 +808,11 @@ def num_lookup():
     t_start = time.time()
     number  = getattr(g, 'override_num', None) or request.args.get('num') or request.args.get('number', '')
     if not number:
-        return jsonify({"success": False, "error": "Missing number"}), 400
+        return jsonify({"status": False, "error": "Missing number", "developer": DEVELOPER_TAG}), 400
 
     _, num_c, country = valid_num(number)
     if not num_c:
-        return jsonify({"success": False, "error": "Empty number"}), 400
+        return jsonify({"status": False, "error": "Empty number", "developer": DEVELOPER_TAG}), 400
 
     # ── Cache check ──
     cached = cache_get(num_c)
@@ -650,9 +820,14 @@ def num_lookup():
         stats["cache_hits"] += 1
         import json as _json
         from flask import Response as _Resp
-        resp_data = dict(cached)
-        resp_data["response_time"] = f"{(time.time() - t_start):.2f}s"
-        resp_data["made_by"]       = get_bot_username()
+        resp_data = {
+            "status":        True,
+            "query":         num_c,
+            "developer":     DEVELOPER_TAG,
+            "data":          {k: v for k, v in cached.items() if k not in ("status", "made_by")},
+            "response_time": f"{(time.time() - t_start):.2f}s",
+            "cached":        True
+        }
         return _Resp(_json.dumps(resp_data, ensure_ascii=False), mimetype='application/json')
 
     stats["total"] += 1
@@ -670,7 +845,7 @@ def num_lookup():
     acc_id, acc_client = acc_manager.next_client()
     if not acc_client:
         pending.pop(req_id, None); stats["failed"] += 1
-        return jsonify({"success": False, "error": "No active Telegram accounts"}), 503
+        return jsonify({"status": False, "error": "No active Telegram accounts", "developer": DEVELOPER_TAG}), 503
 
     pending[req_id]["acc_id"] = acc_id
 
@@ -681,7 +856,7 @@ def num_lookup():
         asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=10)
     except Exception as e:
         pending.pop(req_id, None); stats["failed"] += 1
-        return jsonify({"success": False, "error": f"Send failed: {e}"}), 500
+        return jsonify({"status": False, "error": f"Send failed: {e}", "developer": DEVELOPER_TAG}), 500
 
     deadline = time.time() + 90
     while time.time() < deadline:
@@ -691,33 +866,36 @@ def num_lookup():
             pending.pop(req_id, None)
             elapsed = f"{(time.time() - t_start):.2f}s"
 
-            if result and result.get("success"):
+            if result and result.get("status"):
                 stats["success"] += 1
                 import json as _json
                 from flask import Response as _Resp
-                data = {
+                inner = {
                     "country":       result.get("country", country),
                     "number":        num_c,
                     "total_records": result.get("total_records", 0),
-                    "records":       result.get("records", []),
                     "total_results": result.get("total_results", 0),
-                    "response_time": elapsed,
-                    "made_by":       get_bot_username()
+                    "records":       result.get("records", [])
                 }
-                # Save to cache (without response_time so it's fresh each time)
-                cache_payload = {k: v for k, v in data.items() if k != "response_time"}
-                cache_set(num_c, cache_payload)
+                data = {
+                    "status":        True,
+                    "query":         num_c,
+                    "developer":     DEVELOPER_TAG,
+                    "data":          inner,
+                    "response_time": elapsed
+                }
+                cache_set(num_c, inner)
                 return _Resp(_json.dumps(data, ensure_ascii=False), mimetype='application/json')
             else:
                 stats["failed"] += 1
-                return jsonify({"success": False, "error": result.get("error", "No data"),
-                                "response_time": elapsed}), 500
+                return jsonify({"status": False, "error": result.get("error", "No data"),
+                                "developer": DEVELOPER_TAG, "response_time": elapsed}), 500
         time.sleep(0.3)
 
     pending.pop(req_id, None); stats["failed"] += 1
     elapsed = f"{(time.time() - t_start):.2f}s"
-    return jsonify({"success": False, "error": "Timeout — bot didn't respond in 90s",
-                    "response_time": elapsed}), 504
+    return jsonify({"status": False, "error": "Timeout — bot didn't respond in 90s",
+                    "developer": DEVELOPER_TAG, "response_time": elapsed}), 504
 
 # ==================== TG LOOKUP ====================
 USERID_API     = "https://username-usrid-to-num.onrender.com"
@@ -1560,6 +1738,7 @@ async def start_all_clients():
             acc_manager.set_client(row["id"], client)
             client.add_event_handler(on_message)
             client.add_event_handler(on_leak_message)
+            client.add_event_handler(on_leak_edited)
             print(f"[ACC] {row['name']} — connected OK")
         except Exception as e:
             print(f"[ACC] {row['name']} — failed: {e}")
